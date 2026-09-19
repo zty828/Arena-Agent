@@ -1085,6 +1085,44 @@ ipcMain.handle('arena:state', () => ({
  * lands. Guarded on `selfTest` so it is unreachable in a normal window, and confined to the
  * workspace root so it can never remove or overwrite anything the fixture does not own.
  */
+// Agent Skills, operator side.
+//
+// The window is deliberately a thin client here: the daemon owns the skills directory, validates
+// before writing, and re-discovers after every change. Putting the install logic in the window
+// would create a second writer for a directory whose contents are instructions an agent will
+// follow, and would put the only copy of the validation rules somewhere no probe can reach.
+ipcMain.handle('skills:list', async () => {
+  if (!daemon || !adminToken) return { roots: [], skills: [], invalid: [], shadowed: [] };
+  const response = await adminRequest('/admin/v1/skills');
+  if (!response.ok) throw new Error(`读取技能列表失败：HTTP ${response.status}`);
+  return await response.json();
+});
+ipcMain.handle('skills:choose', async () => {
+  const result = await dialog.showOpenDialog({ properties: ['openDirectory'], title: '选择技能目录（其中应包含 SKILL.md）' });
+  return result.canceled ? null : (result.filePaths[0] ?? null);
+});
+ipcMain.handle('skills:install', async (_event, source?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法安装技能');
+  if (typeof source !== 'string' || !source.trim() || source.length > 1024) throw new Error('请先选择一个技能目录');
+  const response = await adminRequest('/admin/v1/skills/install', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source }),
+  });
+  const body = await response.json() as { name?: string; files?: number; error?: { message?: string } };
+  if (!response.ok) throw new Error(body?.error?.message ?? `安装失败：HTTP ${response.status}`);
+  trace(`skills: installed "${body.name}" (${body.files} files)`);
+  return { name: body.name, files: body.files };
+});
+ipcMain.handle('skills:remove', async (_event, name?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法删除技能');
+  if (typeof name !== 'string' || !name.trim() || name.length > 64) throw new Error('无效的技能名');
+  const response = await adminRequest('/admin/v1/skills/remove', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  const body = await response.json() as { error?: { message?: string } };
+  if (!response.ok) throw new Error(body?.error?.message ?? `删除失败：HTTP ${response.status}`);
+  trace(`skills: removed "${name}"`);
+  return { ok: true };
+});
 ipcMain.handle('selftest:fixture', async (_event, action?: unknown, name?: unknown) => {
   if (!selfTest) throw new Error('the fixture hook is only available under --self-test');
   // The fixture only ever creates and deletes its own probe entries: no traversal, no absolute

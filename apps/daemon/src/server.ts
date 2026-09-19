@@ -13,6 +13,7 @@ import { ToolHost, ToolDescriptions, ToolSchemas } from './tools.js';
 import { acquireStateLease } from './state-lease.js';
 import { CONSOLE_HTML } from './console.js';
 import { ProviderGateway, GatewayConfigSchema, buildAdapter } from '../../../packages/provider-gateway/src/index.js';
+import { SkillRegistry, installSkillFromDirectory, removeSkill } from '../../../packages/skills/src/index.js';
 
 const MAX_BODY=1024*1024;
 export const ConfigSchema=z.object({
@@ -36,7 +37,21 @@ export const ConfigSchema=z.object({
     // must accept it even though it still listens on loopback.
     allowed_hosts:z.array(z.string().min(1).max(253)).max(16).default([]),
     require_grant:z.literal(true).default(true)
-  }).strict().default({enabled:false,acknowledge_exposure:false,bind_address:'127.0.0.1',allow_cidrs:[],allowed_hosts:[],require_grant:true})
+  }).strict().default({enabled:false,acknowledge_exposure:false,bind_address:'127.0.0.1',allow_cidrs:[],allowed_hosts:[],require_grant:true}),
+  // Agent Skills roots. The application's own `skills/` directory is always searched first and is
+  // where the window installs into; these are *additional* read-only roots, so an operator can
+  // also expose skills another tool already installed (say ~/.workbuddy-ai/skills) without
+  // copying them. Kept out of the workspace on purpose: a skill that the code under instruction
+  // could edit would be a way to rewrite the instructions between runs.
+  skills:z.object({
+    roots:z.array(z.string().min(1).max(1024)).max(8).default([]),
+    // Where installs land. Defaults to the application's own `skills/` directory, which is what
+    // makes an installed skill travel with the folder. Overridable so a test — or an operator with
+    // an opinion about where their skills live — can point it elsewhere without touching the real
+    // one; the smoke test relies on this to exercise install/remove without writing into the
+    // directory the operator actually uses.
+    install_root:z.string().min(1).max(1024).optional()
+  }).strict().default({roots:[]})
 }).strict();
 export type DaemonConfig=z.infer<typeof ConfigSchema>;
 export interface DaemonHandle {
@@ -47,7 +62,12 @@ export function capabilities(gateway?:ProviderGateway){const modelGateway=gatewa
   schema_version:'1.0',product:'ArenaBridge',version:APP_VERSION,delivery_stage:'0/1 plus client-tools gateway alpha',production_ready:false,
   modes:{remote_workspace:{status:'implemented_local',execution_owner:'remote_workspace'},provider_gateway_client_tools:{status:modelGateway?.enabled?'enabled_experimental':'disabled_configurable',execution_owner:'client'},provider_gateway_bridge_tools:{status:'not_implemented',execution_owner:'bridge'},mcp_task_service:{status:'not_implemented',execution_owner:'bridge'}},
   mcp:{sdk:'@modelcontextprotocol/server@2.0.0',versions:[MODERN_VERSION,LEGACY_VERSION],transport:'streamable_http',modern:{session:false,discovery:true},legacy:{session:true,initialize:true,get_sse:false,last_event_id:false},subscriptions:false,mrtr:false,sampling:false,resources:false,prompts:false},
-  tools:{read:'bounded UTF-8',patch:'create/update, exact preflight and approval',regex:false,delete:false,move:false,pty:'capability_unavailable',lsp:'capability_unavailable',skills_external_mounts:false,max_parallel:4},
+  tools:{read:'bounded UTF-8',patch:'create/update, exact preflight and approval',regex:false,delete:false,move:false,pty:'capability_unavailable',lsp:'capability_unavailable',
+    // Skills are mounted (read-only) outside the workspace. `skills_can_execute` is stated
+    // separately and stays false: a skill's scripts/ is a directory of files, and running one
+    // still goes through run_command under the exec tier, so no skill can widen what a caller may
+    // do. `allowed-tools` is reported to the caller as text and is never treated as a grant.
+    skills_external_mounts:true,skills_can_execute:false,skills_format:'agentskills.io SKILL.md',max_parallel:4},
   model_api:{chat_completions:'implemented_bounded_client_tools_alpha',responses:'unsupported_protocol',anthropic_messages:'unsupported_protocol',gateway:modelGateway??{enabled:false,execution_owner:'client',tools_executed_by_gateway:false}},
   arena:{status:'blocked',authorization:false,live_test:false,mailbox_enabled:false,reason:'No platform permission or approved data agreement supplied'},
   federation:{status:'not_implemented'},tunnels:{quick:'not_implemented; no SSE support',named:'not_implemented',ngrok:'not_implemented'},
@@ -144,7 +164,14 @@ export async function createDaemon(input:unknown,credentials:{adminToken:string;
 }
 async function startDaemon(config:DaemonConfig,credentials:{adminToken:string;clientToken:string;mcpToken?:string},store:Store):Promise<DaemonHandle>{
   const state=path.resolve(config.state_directory),epoch=store.recoverOnStart();
-  const policy=new PolicyEngine(store,credentials,epoch),host=new ToolHost(store,policy,state);
+  // The application's own skills directory travels with the application, which is what makes an
+  // installed skill survive moving the folder — the same property the bundled release depends on.
+  // It stays the first root, and therefore the install target, unless a config says otherwise.
+  const appRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../..');
+  const installRoot=config.skills.install_root?path.resolve(config.skills.install_root):path.join(appRoot,'skills');
+  const skills=new SkillRegistry([installRoot,...config.skills.roots.map(root=>path.resolve(root))]);
+  await skills.discover();
+  const policy=new PolicyEngine(store,credentials,epoch),host=new ToolHost(store,policy,state,skills);
   const gateway=new ProviderGateway(store,buildAdapter(config.gateway,process.env));
   const workspaces:Workspace[]=[];
   for(const candidate of config.workspaces){
@@ -264,6 +291,30 @@ async function startDaemon(config:DaemonConfig,credentials:{adminToken:string;cl
           if(req.method==='GET'&&route==='/admin/v1/workspace/file'){
             const arg=z.object({path:z.string().min(1).max(1024)}).strict().parse({path:address.searchParams.get('path')??''});
             json(res,200,await host.adminReadFile(workspaces[0]!.id,arg.path));return;
+          }
+          // Agent Skills, operator side. Installs land in the application's own skills directory
+          // (the first root) and are validated before anything is written; the registry is
+          // re-discovered immediately, so a newly installed skill is usable without restarting the
+          // daemon — the window would otherwise have to tell the operator to reopen it, which is
+          // the kind of instruction that makes a feature feel broken.
+          if(req.method==='GET'&&route==='/admin/v1/skills'){
+            json(res,200,{roots:skills.roots,skills:skills.list(),invalid:skills.problemsList,shadowed:skills.shadowedList});return;
+          }
+          if(req.method==='POST'&&route==='/admin/v1/skills/install'){
+            const arg=z.object({source:z.string().min(1).max(1024)}).strict().parse(value);
+            const outcome=await installSkillFromDirectory(arg.source,skills.roots[0]!);
+            // Refusals are errors, not a 200 with ok:false, so the window cannot accidentally treat
+            // "we declined to install this" as a success with an empty result.
+            if(!outcome.ok)throw new BridgeError('INVALID_ARGUMENT',400,outcome.reason??'Install refused');
+            await skills.discover();
+            json(res,201,outcome);return;
+          }
+          if(req.method==='POST'&&route==='/admin/v1/skills/remove'){
+            const arg=z.object({name:z.string().min(1).max(64)}).strict().parse(value);
+            const outcome=await removeSkill(skills.roots[0]!,arg.name);
+            if(!outcome.ok)throw new BridgeError('INVALID_ARGUMENT',400,outcome.reason??'Remove refused');
+            await skills.discover();
+            json(res,200,outcome);return;
           }
           const patch=/^\/admin\/v1\/workspaces\/([^/]+)\/patches\/([^/]+)$/.exec(route);
           if(req.method==='GET'&&patch){json(res,200,await host.previewForAdmin(patch[1]!,patch[2]!));return;}

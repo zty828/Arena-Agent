@@ -1,6 +1,6 @@
 # 需求与验收追踪
 
-版本 0.1.0-stage1；所有行必须结合 coverage/限制阅读。implemented 只说明列明子集已有代码，不等于整项满足。本表由 scripts/traceability.mjs 生成，全量回归结论读自 outputs/verification.json（最近一次：passed 111/111, 22 stages exit 0 (2026-09-19T03:27:56.305Z)），不写死在这个文件里。
+版本 0.1.0-stage1；所有行必须结合 coverage/限制阅读。implemented 只说明列明子集已有代码，不等于整项满足。本表由 scripts/traceability.mjs 生成，全量回归结论读自 outputs/verification.json（最近一次：passed 111/111, 23 stages exit 0 (2026-09-19T10:42:09.934Z)），不写死在这个文件里。
 
 ## B/N/O/X
 
@@ -17,7 +17,7 @@
 | B09 | S01 / 原理复现 | not_tested / none | tools unavailable endpoints | T22 | 无适配器时明确capability_unavailable；无真实IDE/LSP，不用搜索冒充 |
 | B10 | S01 / 原理复现 | implemented / partial | packages/workspace-tools/command.ts | T20,T21 | exec 档 run_command：工作区内 cwd、超时、输出上限、杀整棵进程树、逐条审计（probe:exec）；无 PTY 与交互式输入；命令无逐条批准、无 OS 沙箱 |
 | B11 | S01 / 原理复现 | implemented / partial | ToolHost; PatchEngine | T12,T16 | 最多4个本地工具，固定顺序写锁；并发上限/压力测试不全；未声称8路/8账号 |
-| B12 | S01,S07 / 原理复现 | not_tested / none | planned: readonly Skills mounts | T27 | ；外挂载Skills/脚本执行未实现 |
+| B12 | S01,S07 / 原理复现 | implemented / partial | packages/skills; apps/daemon/tools; apps/desktop | T27 | 规范实现：发现/校验/渐进披露；工作区外只读挂载；窗口内安装/删除（先校验后写、链接拒绝、不覆盖、原子落位）；容忍规范外字段；无 URL/zip 安装；无版本与依赖解析；未做跨工具目录的自动发现（需配置） |
 | B13 | S01 / 生产强化的等价用途 | implemented / partial | policy-engine | T13,T24 | Ask/Plan只读、Code补丁需本地一次性批准；仅本地控制API审批，真实UI和OS沙箱未完成 |
 | B14 | S01 / 原理复现 | implemented / partial | storage; patches; state-lease | T17,T21,T37 | 冲突不覆盖/中间态恢复/unknown/取消新动作；无安全用户回滚与 PTY 恢复；窗口提供补丁审阅，不是完整 Diff UI |
 | B15 | S03-S05 / 原理复现 | implemented / partial | scripts/tunnel-cloudflared.mjs | T31 | Quick Tunnel 提供非回环访问，含 Host 白名单与匿名拒绝；生产/长期隧道与跨设备会话未验收 |
@@ -64,7 +64,7 @@
 | T24 | grant/approval/replay/identity | implemented / partial | tests/security.test.ts; tests/protocol.test.ts | challenge、过期、重放、参数替换、消费、撤权分组通过 |
 | T25 | prompt injection in untrusted data | implemented / partial | tests/security.test.ts | 文件中的指令JSON不触发动作；模型/下游返回链未实现 |
 | T26 | forged tool envelope/schema replay | implemented / partial | tests/gateway.test.ts; tests/security.test.ts | 不完整/越权/未知/重放tool_call_id与schema不匹配全部拒绝且不执行；网页文本envelope未实现 |
-| T27 | Skills/scripts cannot bypass approval | not_tested / none |  | 不提供脚本执行，无执行沙箱验收 |
+| T27 | Skills/scripts cannot bypass approval | implemented / partial | scripts/probe-skills.mjs | skill 只读挂载、无专用执行入口；allowed-tools 只作信息展示，鉴权模块不认识该字段（有结构断言 + 变异测试覆盖） |
 | T28 | federation/auth/names/stdio launch | not_tested / none |  | 外部MCP聚合未实现 |
 | T29 | no secrets in diagnostics/logs | implemented / partial | tests/security.test.ts; tests/demo.ts | 事件及演示输出检查凭据不出现；完整诊断包未实现 |
 | T30 | personal files safety lifecycle | not_tested / partial | tests/workspace.test.ts | 拒绝Home/标准个人目录为root；不提供删除移动，完整回收站流程未实现 |

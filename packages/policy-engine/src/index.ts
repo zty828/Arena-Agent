@@ -24,7 +24,11 @@ export const ACCESS_MODES = ['ask','plan','code','exec'] as const;
  * withholding `workspace:patch` from it would suggest a limit that does not exist.
  */
 const scopesFor = (mode:AccessMode):string[] => [
-  'workspace:read','progress:write',
+  // `skills:read` is granted in every mode on purpose. A skill is documentation the operator
+  // installed on this machine, not workspace data: reading one cannot change anything, and an
+  // `ask`-tier caller that cannot see what the operator made available cannot follow the
+  // operator's own instructions either.
+  'workspace:read','progress:write','skills:read',
   ...(mode==='code'||mode==='exec'?['workspace:patch']:[]),
   ...(mode==='exec'?['workspace:exec']:[])
 ];

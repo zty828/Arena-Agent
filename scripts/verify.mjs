@@ -81,6 +81,12 @@ await run('probe-grant-lifetime',[path.join(root,'scripts','probe-grant-lifetime
 // environment, a killable process tree, the audit record, and a regex that cannot wedge the
 // daemon's single event loop.
 await run('probe-exec',[path.join(root,'scripts','probe-exec.mjs')]);
+// Agent Skills. The format is the cross-tool one, so the checks that matter are the conformance
+// rules other tools rely on, the two boundaries this bridge adds (a skill is read-only, and its
+// `allowed-tools` field is never treated as a grant), and progressive disclosure — the listing
+// must not carry a body, because a listing that leaked bodies would silently defeat the whole
+// point and no caller could tell it had happened.
+await run('probe-skills',[path.join(root,'scripts','probe-skills.mjs')]);
 // The window's own checks run here too. They are the only automated coverage of two things a
 // headless probe cannot reach: that the mode picker exists and defaults to read-only, and that
 // the operator's choice survives contextBridge into the main process. Skipping this stage is how

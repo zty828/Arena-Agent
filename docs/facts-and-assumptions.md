@@ -34,7 +34,7 @@ run 的工作区、principal、mode、execution_owner 使用 SQLite trigger 固�
 | [S04 网站接入](https://docs.shuncode.top/docs/bridge/clients) | 官方正文列出 Streamable HTTP、网站连接和 Arena Agent 使用方式 | 作者“已测试”不等于平台能力保证、用途许可或本项目实测 |
 | [S05 启动](https://docs.shuncode.top/docs/bridge/start/) | Quick、Named、ngrok 三种通道；原产品使用前有其自身授权 | 本项目不复制原产品设备/计费授权，不绕过授权 |
 | [S06 Chat MCP](https://docs.shuncode.top/docs/advanced/mcp) | Chat 是外部 MCP 客户端；Bridge 是对外服务端；Bridge 不能调用 Chat 配置的 MCP | 第三方 MCP 聚合是本项目新增，不是原功能 |
-| [S07 Skills](https://docs.shuncode.top/docs/advanced/skills) | Bridge 可把 Skills 当文件目录读取，可位于工作区外 | 不意味着本项目要实现任意本机路径读取；本轮外挂载未实现 |
+| [S07 Skills](https://docs.shuncode.top/docs/advanced/skills) | Bridge 可把 Skills 当文件目录读取，可位于工作区外 | **已实现（2026-09-19）**：按 agentskills.io 规范只读挂载 + `list_skills`/`read_skill` 两个工具。仍**不**实现任意本机路径读取——只读的是程序目录下的 `skills/` 加上配置里显式列出的根 |
 | [补充：安装页面](https://docs.shuncode.top/docs/install/) | 文档声明当前版本 0.7.2 | 当前页面不能证明各功能首次出现的历史版本 |
 | [S11 Arena Terms](https://help.arena.ai/articles/5629909088-terms-of-use) | 正文 Last Updated 2026-02-23；包含自动化/程序化访问、自动查询与抓取限制 | personal/internal business use 不是 API 化或后台 worker 的许可，也不应泛化为一切商业用途禁止 |
 | [S12 Privacy](https://help.arena.ai/articles/3765052346-privacy-policy) | 正文更新 2025-12-16；输入输出/交互数据可向第三方共享并可能公开 | 文件保留本机不代表读取片段、Diff、终端输出或秘密不会外传 |

@@ -50,6 +50,7 @@
       <button data-view="files">文件</button>
       <button data-view="grants">授权</button>
       <button data-view="events">原始事件</button>
+      <button data-view="skills">技能</button>
     </nav>
 
     <div id="views">
@@ -211,6 +212,27 @@
           <span class="muted">已脱敏：只含摘要与哈希，不含文件正文或凭据</span>
         </div>
         <pre id="events"></pre>
+      </section>
+
+      <!-- Skills: what the agent can be told to do, and the only place an install happens.
+           Installs land in the application's own skills/ directory, so an installed skill travels
+           with the folder rather than with a workspace. -->
+      <section data-view="skills" class="view">
+        <div class="view-head">
+          <button id="skillsRefresh" class="ghost">刷新</button>
+          <span class="muted">按 agentskills.io 规范读取 <code>SKILL.md</code>；技能与工作区解耦</span>
+        </div>
+        <div class="row">
+          <button id="skillsInstall">安装技能目录…</button>
+          <span class="muted" id="skillsRoot"></span>
+        </div>
+        <p class="muted" id="skillsStatus"></p>
+        <div id="skillsList"></div>
+        <div id="skillsProblems" hidden></div>
+        <p class="muted">
+          技能是<strong>只读</strong>的：技能可以描述一条命令，但要跑仍然需要 <code>run_command</code> 与 <code>exec</code> 档，
+          技能本身不授予任何执行权。技能里的 <code>allowed-tools</code> 只作展示，不参与授权。
+        </p>
       </section>
     </div>
   </main>

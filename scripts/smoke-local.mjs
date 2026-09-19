@@ -19,7 +19,12 @@ ensureLocalConfig(root);
 const baseConfig = JSON.parse(fs.readFileSync(path.join(root, 'outputs', 'run-local.config.json'), 'utf8'));
 // A private state directory, so a smoke run never fights over the lock held by a
 // session the user already has open.
-const config = { ...baseConfig, state_directory: path.join(root, 'outputs', 'smoke-state', `s-${Date.now()}`), ports: { api: 0, mcp: 0, admin: 0 } };
+const config = { ...baseConfig, state_directory: path.join(root, 'outputs', 'smoke-state', `s-${Date.now()}`), ports: { api: 0, mcp: 0, admin: 0 },
+  // Skills installs are redirected into this run's own state directory. The real target is the
+  // application's skills folder, and a smoke test must never write into the installation the
+  // operator is actually using — a fixture left behind there would be a skill the agent would
+  // then follow.
+  skills: { roots: [], install_root: path.join(root, 'outputs', 'smoke-state', 'skills') } };
 fs.mkdirSync(config.state_directory, { recursive: true });
 const configPath = path.join(config.state_directory, 'config.json');
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
@@ -107,6 +112,32 @@ try {
 
   const schemas = await (await fetch(`${admin()}/admin/v1/tool-schemas`, { headers: auth(credentials.admin_token) })).json();
   check('workspace tool schemas are exposed for review', Array.isArray(schemas) && schemas.some((tool) => tool.name === 'read_files'), schemas.map((tool) => tool.name));
+  check('the skills tools are exposed for review', schemas.some((tool) => tool.name === 'list_skills') && schemas.some((tool) => tool.name === 'read_skill'), schemas.map((tool) => tool.name));
+
+  // Agent Skills, end to end through the real admin plane. Installs are redirected into this run's
+  // state directory by the config above, so none of this touches the operator's own skills.
+  const skillsList = await (await fetch(`${admin()}/admin/v1/skills`, { headers: auth(credentials.admin_token) })).json();
+  check('the skills endpoint lists its roots', Array.isArray(skillsList.skills) && skillsList.skills.length === 0 && Array.isArray(skillsList.roots) && skillsList.roots.length >= 1, { roots: skillsList.roots?.length, skills: skillsList.skills?.length });
+
+  const badInstall = await fetch(`${admin()}/admin/v1/skills/install`, { method: 'POST', headers: auth(credentials.admin_token), body: JSON.stringify({ source: path.join(root, 'scripts') }) });
+  const badBody = await badInstall.json();
+  check('installing something that is not a skill is refused', badInstall.status === 400 && /SKILL\.md|frontmatter/.test(JSON.stringify(badBody)), { status: badInstall.status, body: badBody });
+
+  // The directory name has to match the skill name — the spec requires it, and the first version
+  // of this fixture got it wrong and was (correctly) refused by the daemon.
+  const sourceSkill = path.join(config.state_directory, 'smoke-fixture');
+  fs.mkdirSync(sourceSkill, { recursive: true });
+  fs.writeFileSync(path.join(sourceSkill, 'SKILL.md'), ['---', 'name: smoke-fixture', 'description: Installed by the smoke test and removed again.', '---', 'body'].join('\n'), 'utf8');
+  const install = await fetch(`${admin()}/admin/v1/skills/install`, { method: 'POST', headers: auth(credentials.admin_token), body: JSON.stringify({ source: sourceSkill }) });
+  const installed = await install.json();
+  check('a conforming skill installs through the admin plane', install.status === 201 && installed.name === 'smoke-fixture', { status: install.status, body: installed });
+
+  const afterInstall = await (await fetch(`${admin()}/admin/v1/skills`, { headers: auth(credentials.admin_token) })).json();
+  check('an installed skill is usable without a restart', afterInstall.skills.some((skill) => skill.name === 'smoke-fixture'), afterInstall.skills.map((skill) => skill.name));
+
+  const removed = await fetch(`${admin()}/admin/v1/skills/remove`, { method: 'POST', headers: auth(credentials.admin_token), body: JSON.stringify({ name: 'smoke-fixture' }) });
+  const afterRemove = await (await fetch(`${admin()}/admin/v1/skills`, { headers: auth(credentials.admin_token) })).json();
+  check('a removed skill disappears without a restart', removed.status === 200 && !afterRemove.skills.some((skill) => skill.name === 'smoke-fixture'), { status: removed.status, left: afterRemove.skills.map((skill) => skill.name) });
 
   const events = await (await fetch(`${admin()}/admin/v1/events`, { headers: auth(credentials.admin_token) })).json();
   const leaked = JSON.stringify(events).includes(credentials.api_token) || JSON.stringify(events).includes(credentials.admin_token);

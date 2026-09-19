@@ -49,6 +49,10 @@ const NEVER_SHIP = new Set([
   '.git', '.github', '.gitignore',
   '.workbuddy-ai', '.test-data', '.arena-bridge', '.arenabridge-sandbox.json',
   'outputs',
+  // Installed skills are operator data, and a skill is a set of instructions an agent then
+  // follows. Shipping them would put the maintainer's own skills inside a public release bundle;
+  // whoever downloads it can add their own into the bundle's skills/ directory afterwards.
+  'skills',
 ]);
 /** The single run-artefact that IS shipped: the fixture the test suite asserts against. */
 const ALWAYS_SHIP = [path.join('outputs', 'synthetic-workspace')];

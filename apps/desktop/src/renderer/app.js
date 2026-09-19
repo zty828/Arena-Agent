@@ -834,11 +834,88 @@ async function refreshActivity() { await refreshEvents(); renderActivity(); }
 async function refreshGrants() { await refreshEvents(); renderGrants(); }
 async function refreshRawEvents() { await refreshEvents(); $('events').textContent = JSON.stringify(S.events, null, 2); }
 
+// Skills. The list is metadata only — the same progressive-disclosure rule the daemon's
+// `list_skills` follows — so this panel can show every installed skill without pulling any of
+// their text into the window.
+async function refreshSkills() {
+  renderSkills(await window.bridgeHost.skillsList());
+}
+
+function renderSkills(data) {
+  const list = $('skillsList');
+  list.textContent = '';
+  const skills = data?.skills ?? [];
+  $('skillsRoot').textContent = data?.roots?.length ? `安装到 ${data.roots[0]}` : '';
+  $('skillsStatus').textContent = skills.length
+    ? `已安装 ${skills.length} 个技能`
+    : '还没有安装任何技能。点上面的按钮，选一个包含 SKILL.md 的目录。';
+
+  for (const skill of skills) {
+    const row = document.createElement('div');
+    row.className = 'skill-row';
+    const head = document.createElement('div');
+    head.className = 'skill-head';
+    const name = document.createElement('strong');
+    name.textContent = skill.name;
+    const count = document.createElement('span');
+    count.className = 'muted';
+    count.textContent = `${skill.file_count} 个文件`;
+    const remove = document.createElement('button');
+    remove.className = 'ghost';
+    remove.textContent = '删除';
+    remove.onclick = async () => {
+      if (!window.confirm(`删除技能「${skill.name}」？`)) return;
+      try {
+        await window.bridgeHost.skillsRemove(skill.name);
+        toast(`已删除 ${skill.name}`);
+        await refreshSkills();
+      } catch (error) { toast(error.message, true); }
+    };
+    head.append(name, count, remove);
+    const description = document.createElement('p');
+    description.className = 'muted';
+    description.textContent = skill.description;
+    row.append(head, description);
+    // `allowed-tools` is shown and labelled for what it is: a claim by the skill, not a permission
+    // this bridge grants. Showing it without that label would read as a capability.
+    if (skill['allowed-tools']) {
+      const declared = document.createElement('p');
+      declared.className = 'muted';
+      declared.textContent = `技能自称可用的工具：${skill['allowed-tools']}（仅展示，不授予权限）`;
+      row.append(declared);
+    }
+    list.append(row);
+  }
+
+  // A skill that failed validation, or one shadowed by a same-named skill in an earlier root, is
+  // reported rather than hidden: "not installed" and "installed but silently not loading" are
+  // indistinguishable from the outside, and only the operator can act on the difference.
+  const problems = [
+    ...(data?.invalid ?? []),
+    ...(data?.shadowed ?? []).map((s) => ({ directory: s.directory, reason: `被 ${s.shadowed_by} 遮蔽` })),
+  ];
+  const box = $('skillsProblems');
+  box.hidden = problems.length === 0;
+  box.textContent = '';
+  if (problems.length) {
+    const title = document.createElement('p');
+    title.className = 'muted';
+    title.textContent = `${problems.length} 个目录没有被加载：`;
+    box.append(title);
+    for (const problem of problems) {
+      const line = document.createElement('p');
+      line.className = 'muted';
+      line.textContent = `${problem.directory} — ${problem.reason}`;
+      box.append(line);
+    }
+  }
+}
+
 function switchView(view) {
   S.currentView = view;
   for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('active', b.dataset.view === view);
   for (const s of document.querySelectorAll('.view')) s.classList.toggle('active', s.dataset.view === view);
-  const loaders = { pending: refreshPending, arena: refreshArena, activity: refreshActivity, files: async () => {}, grants: refreshGrants, events: refreshRawEvents };
+  const loaders = { pending: refreshPending, arena: refreshArena, activity: refreshActivity, files: async () => {}, grants: refreshGrants, events: refreshRawEvents, skills: refreshSkills };
   (loaders[view] || (async () => {}))().catch((e) => toast(e.message, true));
   if (view === 'arena' && !arenaTimer) {
     arenaTimer = setInterval(() => {
@@ -880,6 +957,16 @@ $('revokeBtn').onclick = async () => {
 // Skipping the repaint here would make the button look dead.
 $('treeRefresh').onclick = () => loadTree({ force: true }).catch((e) => toast(e.message, true));
 $('evRefresh').onclick = () => refreshRawEvents().catch((e) => toast(e.message, true));
+$('skillsRefresh').onclick = () => refreshSkills().catch((e) => toast(e.message, true));
+$('skillsInstall').onclick = async () => {
+  try {
+    const source = await window.bridgeHost.skillsChoose();
+    if (!source) return;
+    const result = await window.bridgeHost.skillsInstall(source);
+    toast(`已安装 ${result.name}（${result.files} 个文件）`);
+    await refreshSkills();
+  } catch (error) { toast(error.message, true); }
+};
 $('notifyToggle').onchange = () => {
   if ($('notifyToggle').checked && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission();
 };
@@ -1336,6 +1423,25 @@ if (new URLSearchParams(location.search).get('selfTest') === '1') {
         renderAutoApprove();
       }
     }
+
+    // Skills. Two things are asserted: that the panel exists and states the read-only boundary,
+    // and that what it renders is metadata — the same progressive-disclosure rule the daemon
+    // enforces on `list_skills`. A panel that rendered bodies would look identical in a screenshot
+    // and would quietly undo the point of the format.
+    const skillsView = document.querySelector('.view[data-view="skills"]');
+    check('there is a skills tab', !!document.querySelector('#tabs button[data-view="skills"]'));
+    check('there is a skills panel', !!skillsView);
+    check('the skills panel offers an install button', !!$('skillsInstall'), $('skillsInstall') ? 'present' : 'missing');
+    const skillsProse = skillsView?.textContent ?? '';
+    check('the skills panel states that a skill cannot execute anything',
+      /只读/.test(skillsProse) && /不授予任何执行权/.test(skillsProse), skillsProse.slice(0, 80));
+    renderSkills({ roots: ['/tmp/skills'], skills: [{ name: 'demo-skill', description: 'A skill used by the self test.', file_count: 3, 'allowed-tools': 'Bash(git:*) Read' }], invalid: [], shadowed: [] });
+    const skillsText = $('skillsList')?.textContent ?? '';
+    check('the panel renders a skill name and description', /demo-skill/.test(skillsText) && /used by the self test/.test(skillsText), skillsText);
+    check('the panel labels allowed-tools as a claim rather than a permission', /仅展示，不授予权限/.test(skillsText), skillsText);
+    renderSkills({ roots: ['/tmp/skills'], skills: [], invalid: [{ directory: '/x/broken', reason: 'name is required' }], shadowed: [] });
+    check('a skill that failed validation is surfaced rather than hidden',
+      /name is required/.test($('skillsProblems')?.textContent ?? ''), $('skillsProblems')?.textContent);
     await window.bridgeHost.selfTestResult(report);
   })().catch((e) => window.bridgeHost.selfTestResult({ ok: false, checks: [], errors: [String(e && e.message ? e.message : e)] }));
 }

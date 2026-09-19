@@ -20,6 +20,17 @@ dist/
 *.secrets.json
 .env
 
+# --- installed Agent Skills --------------------------------------------------
+# Operator data, not project source. A skill is a set of instructions an agent will
+# follow, chosen by whoever runs this copy. Tracking the directory would publish the
+# maintainer's own skills alongside the code, and would let `git pull` silently change
+# the instructions an agent is already following.
+#
+# Root-anchored on purpose. A bare `skills/` matches at any depth and would also swallow
+# `packages/skills/`, which is where the Agent Skills implementation lives — the source
+# would have been silently left out of every commit.
+/skills/
+
 # --- local tooling -----------------------------------------------------------
 .workbuddy-ai/
 

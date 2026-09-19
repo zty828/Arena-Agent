@@ -316,3 +316,12 @@ pre {
   box-shadow: 0 6px 24px #0008; font-size: 12.5px; z-index: 50;
 }
 .toast.bad { border-color: #6b2b2b; background: #2a1618; }
+
+/* Skills: one row per installed skill. Metadata only — the daemon's listing carries no bodies —
+   so the rows stay short and the panel can show every skill without loading any of their text. */
+.skill-row { border-top: 1px solid var(--line-soft); padding: 10px 0; }
+.skill-row:first-child { border-top: none; }
+.skill-head { display: flex; align-items: center; gap: 8px; }
+.skill-head strong { font-family: var(--mono); color: var(--text); }
+.skill-head .muted { flex: 1 1 auto; }
+.skill-row p { margin: 4px 0 0; font-size: 12px; color: var(--text-dim); }

@@ -70,6 +70,8 @@ contracts.mjs  →  verify.mjs  →  traceability.mjs  →  check-delivery.mjs
 | `probe-auto-approve.mjs` | `npm run probe:auto-approve`：无人值守写入的开关与各道闸门 |
 | `probe-grant-lifetime.mjs` | `npm run probe:grant-lifetime`：授权默认随会话、限时真的会过期 |
 | `probe-exec.mjs` | `npm run probe:exec`：命令执行、edit 助手与真正则搜索 |
+| `probe-skills.mjs` | Agent Skills 的规范符合性（名称规则、目录名一致、字段上限）、渐进披露（**列表不含正文**）、只读边界、路径穿越与链接不跟随 |
+| `mutation-skills.mjs` | `probe-skills.mjs` 的变异测试：逐个破坏它声称守护的 6 个决定，探针必须全部失败。**手工运行，不进 `verify`**——它要改写 `dist` 与一处源码，跑完会自行还原 |
 | `probe-exposed-listener.mjs` | `npm run probe:exposed`：在窗口提供该选项之前，先证明暴露路径可用 |
 | `probe-pinned-remote-port.mjs` | `npm run probe:pinned`：暴露的 daemon 是否真的绑在隧道要转发的那个端口上 |
 | `probe-stale-lease.mjs` | `npm run probe:lease`：被杀掉的 daemon 留下的旧租约能否与活着的区分开 |

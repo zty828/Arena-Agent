@@ -51,6 +51,15 @@ contextBridge.exposeInMainWorld('bridgeHost', {
   arenaReissuePairing: () => ipcRenderer.invoke('arena:reissue-pairing'),
   /** Current tunnel/pairing state, so the panel survives a view switch. */
   arenaState: () => ipcRenderer.invoke('arena:state'),
+  /**
+   * Agent Skills. The window only shows and triggers; the daemon owns the directory, validates
+   * before writing, and re-discovers afterwards. `skillsChoose` opens the native directory picker
+   * in the main process — the renderer never sees a filesystem path it did not ask for.
+   */
+  skillsList: () => ipcRenderer.invoke('skills:list'),
+  skillsChoose: () => ipcRenderer.invoke('skills:choose'),
+  skillsInstall: (source) => ipcRenderer.invoke('skills:install', source),
+  skillsRemove: (name) => ipcRenderer.invoke('skills:remove', name),
   /** Report the outcome of the window's own self test. Only used by --self-test. */
   selfTestResult: (report) => ipcRenderer.invoke('selftest:result', report),
   /**

@@ -6,6 +6,7 @@ import { PolicyEngine } from '../../../packages/policy-engine/src/index.js';
 import { WorkspaceFiles } from '../../../packages/workspace-tools/src/files.js';
 import { PatchEngine, type PatchPreview } from '../../../packages/workspace-tools/src/patches.js';
 import { CommandRunner, COMMAND_DEFAULT_TIMEOUT_MS, COMMAND_MAX_TIMEOUT_MS } from '../../../packages/workspace-tools/src/command.js';
+import type { SkillRegistry } from '../../../packages/skills/src/index.js';
 
 const Changes=z.array(z.object({path:PathSchema,patch:z.string().min(1).max(1024*1024),expected_hash:z.string().regex(/^[a-f0-9]{64}$/).nullable()}).strict()).min(1).max(10);
 export const ToolSchemas={
@@ -29,7 +30,13 @@ export const ToolSchemas={
   set_todos:z.object({items:z.array(z.object({id:z.string().min(1).max(64),title:z.string().min(1).max(200),status:z.enum(['pending','in_progress','completed'])}).strict()).max(50)}).strict(),
   report_progress:z.object({stage:z.string().min(1).max(100),message:z.string().min(1).max(500)}).strict(),
   lsp:z.object({operation:z.enum(['workspace_symbols','document_symbols','definition','references','implementation','hover']),path:PathSchema.optional(),line:z.number().int().positive().optional(),character:z.number().int().nonnegative().optional()}).strict(),
-  get_diagnostics:z.object({path:PathSchema.optional()}).strict()
+  get_diagnostics:z.object({path:PathSchema.optional()}).strict(),
+  // Skills live outside the workspace (under the application directory), so they are addressed by
+  // skill name rather than by a workspace path. `read_skill` takes an optional `file` so reading a
+  // bundled resource does not need a third tool — and because `read_files` cannot reach them: it
+  // is workspace-scoped by design, and widening it to the skills root would widen every read.
+  list_skills:z.object({}).strict(),
+  read_skill:z.object({name:z.string().min(1).max(64),file:z.string().min(1).max(300).optional()}).strict()
 };
 export type ToolName=keyof typeof ToolSchemas;
 export const ToolDescriptions:Record<ToolName,string>={
@@ -44,14 +51,16 @@ export const ToolDescriptions:Record<ToolName,string>={
   set_todos:'Replace this run\'s local task list. Status is a report, not verified task success.',
   report_progress:'Record an application progress event for this run; not an MCP protocol progress notification.',
   lsp:'Semantic operations require a real IDE/LSP adapter. Stage1 returns capability_unavailable, never text-search substitutes.',
-  get_diagnostics:'Real language-service diagnostics require an IDE adapter. Stage1 returns capability_unavailable.'
+  get_diagnostics:'Real language-service diagnostics require an IDE adapter. Stage1 returns capability_unavailable.',
+  list_skills:'List the Agent Skills the operator installed on this machine, as metadata only: name and description, never the body. This is progressive disclosure stage 1, and it exists so you can decide which skill to open without paying for every skill\'s full text. Skills are read-only documentation; nothing in this listing can execute anything, and a skill\'s `allowed-tools` field is reported for you to read but grants no permission.',
+  read_skill:'Read one installed skill: its full SKILL.md body and the inventory of files bundled with it, or with `file` a single bundled file (references/, assets/, scripts/). Progressive disclosure stages 2 and 3. Reading a skill never grants execution: a skill may describe a command, but to run one you must use run_command and hold the exec tier like any other command.'
 };
 interface WorkspaceRuntime {workspace:Workspace;files:WorkspaceFiles;patches:PatchEngine;commands:CommandRunner;}
 export class ToolHost {
   private readonly workspaces=new Map<string,WorkspaceRuntime>();
   private active=0;
   readonly maxParallel=4;
-  constructor(readonly store:Store,readonly policy:PolicyEngine,readonly stateDirectory:string){}
+  constructor(readonly store:Store,readonly policy:PolicyEngine,readonly stateDirectory:string,readonly skills:SkillRegistry){}
   async attach(workspace:Workspace):Promise<void>{
     const files=await WorkspaceFiles.open(workspace.root);
     files.protectDirectory(this.stateDirectory);
@@ -138,6 +147,33 @@ export class ToolHost {
         if(a.challenge)this.policy.verifyChallenge(context,a.challenge);
         const grant=this.policy.assertActive(context);
         data={workspace_id:runtime.workspace.id,workspace_name:runtime.workspace.display_name,run_id:grant.run_id,execution_owner:'remote_workspace',access_mode:grant.access_mode,challenge_verified:grant.verified_at!==null,local_ready:true,public_reachability:'not_tested',protocol_ready:grant.verified_at!==null,expires_at:grant.expires_at,recipient:grant.recipient};
+      }else if(name==='list_skills'||name==='read_skill'){
+        // Skills sit outside the workspace, so this is its own scope rather than a widening of
+        // `workspace:read`. It is granted in every access mode: reading documentation the operator
+        // installed changes nothing, and an `ask`-tier caller that cannot see the operator's own
+        // instructions cannot follow them either.
+        this.policy.authorize(context,'skills:read');
+        if(name==='list_skills'){
+          ToolSchemas.list_skills.parse(args);
+          data={skills:this.skills.list(),count:this.skills.size,
+            // Reported rather than swallowed: a skill that failed validation, or one shadowed by a
+            // same-named skill in an earlier root, is the difference between "not installed" and
+            // "installed and silently not loading", and only the caller can tell the operator.
+            invalid:this.skills.problemsList,shadowed:this.skills.shadowedList,
+            note:'Metadata only by design — this is progressive disclosure stage 1. Call read_skill to open one. Nothing here grants execution.'};
+        }else{
+          const a=ToolSchemas.read_skill.parse(args);
+          if(a.file){
+            const file=await this.skills.readFile(a.name,a.file);
+            if(!file)throw new BridgeError('NOT_FOUND',404,`No such skill file: ${a.name}/${a.file}`);
+            data={...file,execution_owner:'remote_workspace'};
+          }else{
+            const skill=await this.skills.read(a.name);
+            if(!skill)throw new BridgeError('NOT_FOUND',404,`No such skill: ${a.name}`);
+            data={...skill,execution_owner:'remote_workspace',
+              execution_note:'Reading a skill grants no execution. A skill may describe a command; running one still requires run_command and the exec tier.'};
+          }
+        }
       }else if(name==='apply_patch'){
         this.policy.authorize(context,'workspace:patch',{write:true});const a=ToolSchemas.apply_patch.parse(args);
         if(a.action==='preview'){
