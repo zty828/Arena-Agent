@@ -1,0 +1,32 @@
+# --- dependencies and bundled binaries --------------------------------------
+# Deliberately not tracked. The self-contained release bundle ships them; a source
+# checkout installs them with the dependency install. Keeping them out is what makes
+# the repository small enough to clone -- see README, "两种获取方式".
+node_modules/
+runtime/
+
+# --- build output ------------------------------------------------------------
+dist/
+
+# --- local runtime state and secrets -----------------------------------------
+# Never publish these. .arena-bridge holds loopback development credentials and a
+# local SQLite ledger; .test-data and outputs/ hold disposable probe scratch.
+.arena-bridge/
+.test-data/
+.arenabridge-sandbox.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.secrets.json
+.env
+
+# --- local tooling -----------------------------------------------------------
+.workbuddy-ai/
+
+# --- run artefacts -----------------------------------------------------------
+# Everything the probes and tests write is disposable and regenerated on demand.
+# The synthetic workspace they assert against is the one exception: it is tracked
+# on purpose, so a fresh clone can run the suite before writing anything.
+outputs/*
+!outputs/synthetic-workspace/
+!outputs/synthetic-workspace/**

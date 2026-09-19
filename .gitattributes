@@ -1,0 +1,16 @@
+# Line endings, stated explicitly instead of left to each machine's core.autocrlf.
+#
+# `desktop.cmd` must be CRLF in the working tree on every platform: cmd.exe misparses a batch
+# file that uses bare LF (goto labels and parenthesised blocks break), and that failure looks
+# like a broken project rather than a checkout setting. Without this file the ending depends on
+# the cloner's `core.autocrlf`, so the same commit could run for one person and not for another.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Windows executables and other binaries must never be line-ending-translated.
+*.exe binary
+*.dll binary
+*.png binary
+*.ico binary
+*.zip binary

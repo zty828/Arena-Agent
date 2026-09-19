@@ -1,0 +1,318 @@
+/* ArenaBridge desktop harness.
+   Visual reference: Codex / modern agent IDEs — near-black surfaces, one accent,
+   low-contrast chrome, monospace for anything machine-generated. The rule followed
+   throughout: chrome recedes, content and diff colour carry the meaning. */
+
+:root {
+  --bg: #14161a;
+  --bg-raised: #1a1d22;
+  --bg-inset: #0f1114;
+  --bg-hover: #23272e;
+  --line: #2a2f37;
+  --line-soft: #22262c;
+  --text: #e6e8eb;
+  --text-dim: #9aa2ad;
+  --text-faint: #6b7280;
+  --accent: #4c8dff;
+  --accent-dim: #2f5da8;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+  --add-bg: #12261a;
+  --add-fg: #7ee787;
+  --del-bg: #2a1416;
+  --del-fg: #ffa198;
+  --hunk: #58a6ff;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  --r: 7px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 13px/1.55 var(--sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; cursor: pointer; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #333a44; border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: #414a56; }
+
+/* ---------- shell ---------- */
+#shell {
+  display: grid; height: 100vh;
+  grid-template-columns: 244px minmax(0, 1fr) 300px;
+  grid-template-rows: 44px minmax(0, 1fr);
+  grid-template-areas: "top top top" "side main insp";
+}
+
+#topbar {
+  grid-area: top; display: flex; align-items: center; gap: 12px;
+  padding: 0 12px; background: var(--bg-raised);
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
+}
+#topbar button, #topbar .ws { -webkit-app-region: no-drag; }
+.brand { display: flex; align-items: center; gap: 7px; padding-right: 6px; }
+.mark { width: 11px; height: 11px; border-radius: 3px; background: linear-gradient(135deg, var(--accent), #7c4dff); }
+.brand .name { font-weight: 600; letter-spacing: .2px; }
+
+.ws-btn {
+  display: flex; align-items: center; gap: 8px; max-width: 460px;
+  padding: 5px 9px; background: var(--bg-inset); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.ws-btn:hover { background: var(--bg-hover); border-color: #39414d; }
+.ws-label { font-weight: 500; white-space: nowrap; }
+.ws-path { color: var(--text-faint); font: 11.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chev { width: 11px; height: 11px; color: var(--text-faint); flex: none; }
+
+.spacer { flex: 1; }
+.status { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 12px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
+.dot.ok { background: var(--ok); box-shadow: 0 0 6px #3fb95066; }
+.dot.bad { background: var(--danger); }
+
+.ghost {
+  padding: 5px 10px; background: transparent; color: var(--text-dim);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.ghost:hover { background: var(--bg-hover); color: var(--text); }
+.ghost.danger:hover { color: #fff; background: #6e1d1d; border-color: var(--danger); }
+
+/* ---------- panes ---------- */
+aside { background: var(--bg-raised); overflow: hidden; display: flex; flex-direction: column; }
+#sidebar { grid-area: side; border-right: 1px solid var(--line); }
+#inspector { grid-area: insp; border-left: 1px solid var(--line); }
+.pane-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 12px; font-size: 11px; font-weight: 600;
+  letter-spacing: .7px; text-transform: uppercase; color: var(--text-faint);
+  border-bottom: 1px solid var(--line-soft);
+}
+.icon { background: none; border: none; color: var(--text-faint); font-size: 13px; padding: 0 2px; }
+.icon:hover { color: var(--text); }
+
+/* ---------- file tree ---------- */
+.tree { overflow: auto; flex: 1; padding: 6px 0 14px; }
+.tree-empty { padding: 16px 12px; color: var(--text-faint); font-size: 12px; }
+.node {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 3px 12px 3px 0; background: none; border: none; color: var(--text-dim);
+  font: 12.5px var(--mono); text-align: left; white-space: nowrap;
+}
+.node:hover { background: var(--bg-hover); color: var(--text); }
+.node.active { background: #1d2a3d; color: #cfe0ff; }
+.node .glyph { color: var(--text-faint); flex: none; width: 13px; text-align: center; }
+.node.dir .glyph { color: var(--accent); }
+.node .nm { overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------- main ---------- */
+#main { grid-area: main; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+#tabs { display: flex; gap: 2px; padding: 7px 10px 0; border-bottom: 1px solid var(--line); background: var(--bg-raised); }
+#tabs button {
+  position: relative; padding: 7px 12px 9px; background: none; border: none;
+  color: var(--text-dim); border-bottom: 2px solid transparent; font-size: 12.5px;
+}
+#tabs button:hover { color: var(--text); }
+#tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.pill {
+  display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 4px;
+  border-radius: 8px; background: var(--danger); color: #fff;
+  font-size: 10.5px; font-weight: 700; text-align: center;
+}
+#views { flex: 1; overflow: auto; }
+.view { display: none; padding: 14px 16px 40px; }
+.view.active { display: block; }
+.view-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.muted { color: var(--text-faint); font-size: 12px; }
+.check { display: flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 12px; }
+
+/* ---------- pending approval cards: must never be missable ---------- */
+.pend {
+  border: 1px solid #56333a; border-left: 3px solid var(--danger);
+  border-radius: var(--r); background: #1c1618; padding: 13px 15px; margin-bottom: 12px;
+}
+.pend .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.pend .title { font-weight: 600; font-size: 13.5px; }
+.pend .target { font: 12px var(--mono); color: #ffd0d0; }
+.pend .countdown { margin-left: auto; font: 11.5px var(--mono); color: var(--danger); }
+.pend .countdown.expired { color: var(--text-faint); text-decoration: line-through; }
+.pend .ask { color: var(--text-dim); font-size: 12.5px; margin: 4px 0 10px; }
+dl.kv { display: grid; grid-template-columns: 74px 1fr; gap: 2px 10px; font-size: 12px; margin: 0 0 10px; }
+dl.kv dt { color: var(--text-faint); }
+dl.kv dd { margin: 0; font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+
+.btn-row { display: flex; gap: 8px; }
+.btn-primary { padding: 6px 14px; background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: var(--r); font-weight: 500; }
+.btn-primary:hover { background: #5c98ff; }
+.btn-danger { padding: 6px 12px; background: transparent; color: var(--del-fg); border: 1px solid #56333a; border-radius: var(--r); }
+.btn-danger:hover { background: #3a1d20; }
+
+/* ---------- diff ---------- */
+.diff {
+  border: 1px solid var(--line); border-radius: var(--r); overflow: auto;
+  max-height: 340px; background: var(--bg-inset); margin-bottom: 11px;
+  font: 12px/1.5 var(--mono);
+}
+.diff .fname {
+  position: sticky; top: 0; padding: 5px 10px; background: #1c2027;
+  border-bottom: 1px solid var(--line); color: var(--text-dim);
+}
+.diff .ln { padding: 0 10px; white-space: pre; color: #b9c0ca; }
+.diff .ln.add { background: var(--add-bg); color: var(--add-fg); }
+.diff .ln.del { background: var(--del-bg); color: var(--del-fg); }
+.diff .ln.hunk { background: #16202c; color: var(--hunk); }
+
+/* ---------- timeline ---------- */
+.tl { border-left: 2px solid var(--line); margin: 2px 0 0 6px; padding-left: 15px; }
+.ev { position: relative; padding: 3px 0; font-size: 12.5px; }
+.ev::before {
+  content: ''; position: absolute; left: -21px; top: 10px;
+  width: 7px; height: 7px; border-radius: 50%; background: #3d444e;
+}
+.ev.ok::before { background: var(--ok); }
+.ev.bad::before { background: var(--danger); }
+.ev.wait::before { background: var(--warn); }
+.ev .t { color: var(--text-faint); font: 11px var(--mono); margin-right: 8px; }
+.ev .meta { color: var(--text-faint); font: 11px var(--mono); }
+.run-card { border: 1px solid var(--line); border-radius: var(--r); background: var(--bg-raised); padding: 12px 14px; margin-bottom: 12px; }
+.run-head { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin-bottom: 6px; }
+.run-head strong { font: 12.5px var(--mono); font-weight: 600; }
+.tag { padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--text-dim); font-size: 11px; }
+.tag.ok { border-color: #24582f; color: var(--ok); }
+.tag.bad { border-color: #6b2b2b; color: var(--del-fg); }
+.tag.write { border-color: #6b4a12; color: var(--warn); }
+
+/* ---------- file viewer / code ---------- */
+.fileview { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; background: var(--bg-inset); }
+.code { font: 12px/1.6 var(--mono); overflow: auto; max-height: calc(100vh - 190px); }
+.code .row { display: flex; }
+.code .row:hover { background: #171b21; }
+.code .no {
+  flex: none; width: 52px; text-align: right; padding-right: 12px;
+  color: #495059; user-select: none; background: #12151a;
+}
+.code .src { white-space: pre; color: #c9d1d9; padding-right: 20px; }
+
+/* ---------- tables ---------- */
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+th { color: var(--text-faint); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+code { font: 12px var(--mono); color: #c9d1d9; }
+pre {
+  margin: 0; padding: 12px; background: var(--bg-inset); border: 1px solid var(--line);
+  border-radius: var(--r); overflow: auto; font: 11.5px/1.6 var(--mono); color: #b9c0ca;
+  max-height: calc(100vh - 190px);
+}
+.empty {
+  padding: 30px 20px; text-align: center; color: var(--text-faint);
+  border: 1px dashed var(--line); border-radius: var(--r); background: var(--bg-raised);
+}
+
+/* ---------- inspector ---------- */
+#inspectorBody { overflow: auto; flex: 1; padding: 12px; font-size: 12.5px; }
+#inspectorBody h4 { margin: 0 0 7px; font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--text-faint); font-weight: 600; }
+#inspectorBody .grp { margin-bottom: 16px; }
+#inspectorBody .item { padding: 6px 0; border-bottom: 1px solid var(--line-soft); }
+#inspectorBody .item:last-child { border-bottom: none; }
+#inspectorBody .k { color: var(--text-faint); font-size: 11px; }
+#inspectorBody .v { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+
+/* ---------- Arena tunnel panel ---------- */
+/* The one surface in this window that publishes the workspace to the internet, so it is
+   the one place the design is allowed to be loud: a bordered card, a warning colour, and
+   no visual similarity to the read-only views next to it. */
+.arena-card {
+  border: 1px solid var(--line); border-left: 3px solid var(--warn);
+  border-radius: var(--r); background: var(--bg-raised); padding: 16px 18px; max-width: 760px;
+}
+.arena-card.live { border-left-color: var(--ok); }
+.arena-lead { margin: 0 0 12px; font-size: 14px; }
+.arena-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.arena-head .muted.expired { color: var(--danger); text-decoration: line-through; }
+.arena-warn {
+  margin: 12px 0; padding: 10px 12px; border-radius: var(--r);
+  background: #241d10; border: 1px solid #5a4415; color: #e8d9ae; font-size: 12.5px;
+}
+.arena-card dl.kv { grid-template-columns: 74px 1fr; margin-bottom: 14px; }
+/* Access-mode picker. Sits before the connect button because the choice is baked into the
+   pairing code and cannot be changed afterwards. */
+.arena-mode {
+  margin: 14px 0 4px; padding: 10px 12px 12px; border: 1px solid var(--line);
+  border-radius: var(--r); display: flex; flex-direction: column; gap: 8px;
+}
+.arena-mode legend { padding: 0 6px; color: var(--text-dim); font-size: 12px; }
+.arena-mode label { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 12.5px; }
+.arena-mode label span { display: flex; flex-direction: column; gap: 2px; }
+.arena-mode label em { font-style: normal; color: var(--text-dim); font-size: 12px; }
+.arena-mode input[type="radio"] { margin-top: 3px; flex: none; }
+
+/* Unattended writes: the switch that removes the human from the write path. Styled with the
+   warning colour rather than the neutral fieldset used for the mode picker, because it is not a
+   preference among equivalents — it is the one control here that lowers the safety of the session. */
+.arena-auto {
+  margin: 10px 0 4px; padding: 10px 12px 12px; border: 1px solid #5a4415;
+  border-left: 3px solid var(--warn); border-radius: var(--r);
+  display: flex; flex-direction: column; gap: 8px; background: var(--bg-raised);
+}
+.arena-auto legend { padding: 0 6px; color: var(--warn-fg, #e8d9ae); font-size: 12px; }
+.arena-auto-row { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 12.5px; }
+.arena-auto-row span { display: flex; flex-direction: column; gap: 2px; }
+.arena-auto-row em { font-style: normal; color: var(--text-dim); font-size: 12px; }
+.arena-auto-row input { margin-top: 3px; flex: none; }
+.arena-auto-warn { margin: 0; color: var(--text-dim); font-size: 12px; line-height: 1.6; }
+.arena-auto-warn b { color: var(--del-fg, #e8a0a0); }
+/* Was a <label>, which made the nested <select> the label's implicit control and broke picking a
+   value (a label click toggles its control's popup). Now a plain row with <label for>. */
+.arena-auto-ttl { display: flex; align-items: center; gap: 8px; font-size: 12.5px; flex-wrap: wrap; }
+.arena-auto-ttl label { cursor: default; }
+.arena-auto-ttl select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 3px 6px; font-size: 12.5px; cursor: pointer;
+}
+/* The no-expiry choice is the exception, so it is called out where it is chosen rather than only
+   in the banner the user may have scrolled past. */
+.arena-auto-ttl-note-warn { color: var(--del-fg, #e8a0a0); }
+/* Persistent while the switch is on. Not dismissible: the risk is forgetting it, so it must not
+   be possible to silence the reminder and then walk away. */
+.arena-auto-banner {
+  margin: 12px 0 0; padding: 10px 12px; border: 1px solid #7a2b2b; border-left: 3px solid var(--del-fg);
+  border-radius: var(--r); background: #2a1618; color: var(--text); font-size: 12.5px; line-height: 1.6;
+}
+.arena-auto-banner b { color: var(--del-fg, #e8a0a0); }
+.arena-auto-banner .mono { font-family: var(--mono, ui-monospace, monospace); }
+.arena-clip { margin: 10px 0 0; font-size: 12.5px; }
+.arena-clip .ok-mark { color: var(--ok); }
+.arena-clip .bad-mark { color: var(--del-fg); }
+.arena-steps { margin: 16px 0 10px; padding-left: 22px; color: var(--text-dim); font-size: 12.5px; }
+.arena-steps li { margin-bottom: 5px; }
+
+/* Pairing requests. Loud on purpose: an unapproved request is the one thing the operator must
+   not miss, and it is the reason this panel exists rather than reusing the 待办 list. */
+.arena-pair { margin-top: 14px; }
+.arena-pair-none {
+  padding: 10px 12px; border: 1px dashed var(--line); border-radius: var(--r);
+  color: var(--text-dim); font-size: 12.5px;
+}
+.arena-pair-card {
+  border: 1px solid #5a4415; border-left: 3px solid var(--warn);
+  border-radius: var(--r); background: var(--bg-raised); padding: 12px 14px; margin-bottom: 10px;
+}
+.arena-pair-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.arena-pair-head strong { color: var(--warn-fg, #e8d9ae); }
+.arena-pair-card dl.kv { grid-template-columns: 74px 1fr; margin-bottom: 8px; }
+.arena-pair-card dd.mono { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; word-break: break-all; }
+.arena-pair-card button:disabled { opacity: .5; cursor: default; }
+
+/* ---------- toast ---------- */.toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  padding: 9px 16px; background: #262b33; color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: 0 6px 24px #0008; font-size: 12.5px; z-index: 50;
+}
+.toast.bad { border-color: #6b2b2b; background: #2a1618; }

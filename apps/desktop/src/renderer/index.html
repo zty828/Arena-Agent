@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:*">
+<title>ArenaBridge</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="shell">
+
+  <!-- Top bar: workspace identity first, because "what am I pointed at" is the
+       question the operator asks before anything else. -->
+  <header id="topbar">
+    <div class="brand">
+      <span class="mark"></span>
+      <span class="name">ArenaBridge</span>
+    </div>
+    <div class="ws">
+      <button id="wsButton" class="ws-btn" title="切换工作目录 (Ctrl+O)">
+        <span class="ws-label" id="wsLabel">—</span>
+        <span class="ws-path" id="wsPath"></span>
+        <svg viewBox="0 0 12 12" class="chev"><path d="M2 4.5 6 8.5 10 4.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+    </div>
+    <div class="spacer"></div>
+    <div class="status" id="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">连接中…</span>
+    </div>
+    <button id="revokeBtn" class="ghost danger" title="撤销全部远端授权">撤权</button>
+  </header>
+
+  <!-- Left: workspace file tree. Read-only navigation for now: it reads through the
+       same workspace tools the remote agent uses, so what you see is what it can see. -->
+  <aside id="sidebar">
+    <div class="pane-head">
+      <span>工作目录</span>
+      <button id="treeRefresh" class="icon" title="刷新">⟳</button>
+    </div>
+    <div id="tree" class="tree"><div class="tree-empty">载入中…</div></div>
+  </aside>
+
+  <!-- Center: the main working surface. -->
+  <main id="main">
+    <nav id="tabs">
+      <button data-view="pending" class="active">待办<span class="pill" id="pendingPill" hidden>0</span></button>
+      <button data-view="arena">接 Arena</button>
+      <button data-view="activity">活动</button>
+      <button data-view="files">文件</button>
+      <button data-view="grants">授权</button>
+      <button data-view="events">原始事件</button>
+    </nav>
+
+    <div id="views">
+      <section data-view="pending" class="view active">
+        <div class="view-head">
+          <label class="check"><input type="checkbox" id="notifyToggle"> 有新写请求时提醒我</label>
+          <span class="muted" id="pendingStamp"></span>
+        </div>
+        <div id="pendingList"></div>
+      </section>
+
+      <!-- Arena: the whole remote-agent flow, in the window. This is the page the CLI's
+           arena.cmd provides, except the tunnel, the pairing code and the clipboard all
+           stay here — the operator never has to read a port or copy a token by hand. -->
+      <section data-view="arena" class="view">
+        <div class="view-head">
+          <span class="muted">把当前工作目录通过隧道开放给公网的远端 Agent。开与关都由你决定，关掉窗口即断开。</span>
+        </div>
+
+        <div id="arenaIdle" class="arena-card">
+          <p class="arena-lead">让远端 Agent（Arena）通过 MCP 读写这个工作区。</p>
+          <dl class="kv">
+            <dt>工作目录</dt><dd id="arenaWs">—</dd>
+            <dt>本机端口</dt><dd>仅 127.0.0.1，公网只有隧道地址</dd>
+          </dl>
+          <p class="arena-warn">
+            点下面的按钮后，会先弹一次确认：这个目录会被公网上能拿到配对码的一方读到，
+            隧道由 Cloudflare 终止 TLS，Arena 官方声明 Agent Mode 数据进入公开排行榜。
+            <strong>只对合成 / 无隐私目录这么做。</strong>
+          </p>
+          <!-- The access mode is chosen HERE, before the pairing code is minted, because the
+               code carries a hard ceiling: a remote asking for more than the ceiling is
+               refused with 403 and there is no way to raise it afterwards. Previously every
+               code was minted as `ask`, so editing the prompt to `code` by hand could only
+               ever fail, and the failure looked like a missing permission rather than a
+               ceiling the operator had (unknowingly) set. -->
+          <fieldset id="arenaMode" class="arena-mode">
+            <legend>远端 Agent 能做什么</legend>
+            <label><input type="radio" name="arenaMode" value="ask" checked>
+              <span><strong>只读（ask）</strong><em>可以读文件；任何写操作都会被拒。默认。</em></span></label>
+            <label><input type="radio" name="arenaMode" value="plan">
+              <span><strong>只读并给出计划（plan）</strong><em>与 ask 一样只读，但语义上是先规划后动手。</em></span></label>
+            <label><input type="radio" name="arenaMode" value="code">
+              <span><strong>可写（code）</strong><em>可提交改动预览；<b>每次真正写盘前仍需你在「待办」里单独批准</b>，
+              且只对未变动的文件生效。</em></span></label>
+            <label class="arena-mode-option">
+              <input type="radio" name="arenaMode" value="exec">
+              <span><strong>可写 + 可执行命令（exec）</strong><em>在上面 code 的基础上，
+              <b>远端还能直接在这台机器上跑 shell 命令，而且没有批准这一步</b>：用的是你的账户权限，
+              工作目录被限制在下面这个目录内，默认 30 秒超时、输出各截断 64 KiB，
+              超时/断开/撤权时整棵进程树会被杀掉。命令会全部进审计日志。
+              <b>只在你能承受"远端等于一个 shell"时才选它。</b></em></span></label>
+          </fieldset>
+          <!-- Unattended writes. Sits with the mode picker because it modifies what the chosen
+               mode actually means: `code` normally stops for approval on every write, and this
+               removes that stop. Off by default, so it reads as a deliberate decision rather than
+               a preference. The duration may be a real deadline or none at all. -->
+          <fieldset id="arenaAuto" class="arena-auto">
+            <legend>无人值守写入</legend>
+            <label class="arena-auto-row">
+              <input type="checkbox" id="autoApproveToggle">
+              <span><strong>自动批准每一次写盘</strong>
+                <em>省掉「提交预览 → 你看 diff → 你回话 → 落盘」里的等待。</em></span>
+            </label>
+            <p class="arena-auto-warn" id="autoApproveWarn">
+              <b>这会去掉唯一的人工把关。</b>Arena 那边的 Agent 看到什么、决定写什么，你不会先看到 diff。
+              如果它读到的某个文件里藏了诱导性内容（提示注入），写盘会直接发生。
+              <b>只在没有隐私、且随时可重建的目录上开。</b>
+            </p>
+            <!-- NOT a <label>. A <label> implicitly binds to its first labelable descendant, so a
+                 <select> nested here becomes label.control — and per HTML spec a label click then
+                 toggles that control's popup. The click that opens the dropdown also lands on the
+                 label, which closes it again, so the value never changes and it looks unselectable.
+                 A plain <div> with an explicit <label for> has no such behaviour. -->
+            <div class="arena-auto-ttl">
+              <label for="autoApproveTtl">有效时长</label>
+              <select id="autoApproveTtl">
+                <option value="0">不限时长（不自动失效）</option>
+                <option value="300000">5 分钟</option>
+                <option value="600000">10 分钟</option>
+                <option value="1800000">30 分钟</option>
+                <option value="3600000">1 小时</option>
+              </select>
+              <span class="muted" id="autoApproveTtlNote">到期自动失效，不需要记得关。</span>
+            </div>
+          </fieldset>
+          <div class="btn-row">
+            <button id="arenaStart" class="btn-primary">开启隧道并复制提示词…</button>
+          </div>
+        </div>
+
+        <div id="arenaLive" class="arena-card live" hidden>
+          <div class="arena-head">
+            <span class="tag ok">隧道已开启</span>
+            <span class="muted" id="arenaCountdown"></span>
+            <button id="arenaStop" class="btn-danger" style="margin-left:auto">断开并恢复本机模式</button>
+          </div>
+          <!-- Persistent while unattended writes are on. Deliberately not dismissible: the whole
+               risk of this switch is forgetting it is on, so the reminder has to outlive any
+               "I know, stop telling me" reflex. -->
+          <div id="arenaAutoBanner" class="arena-auto-banner" hidden></div>
+          <dl class="kv">
+            <dt>公网地址</dt><dd id="arenaUrl">—</dd>
+            <dt>配对码</dt><dd id="arenaCode">—</dd>
+            <dt>访问模式</dt><dd id="arenaModeLabel">—</dd>
+            <!-- A second clock, and the one that surprises people: the unattended-write window can
+                 be unlimited, but the credential the remote receives is not. It starts counting
+                 when the remote claims it, so this is stated as a duration. -->
+            <dt>远端授权</dt><dd id="arenaGrantTtl">—</dd>
+            <dt>工作目录</dt><dd id="arenaLiveWs">—</dd>
+          </dl>
+          <div class="btn-row">
+            <button id="arenaCopy" class="btn-primary">再次复制提示词</button>
+            <button id="arenaReissue" class="ghost">重新签发配对码（授权到期后用）</button>
+            <button id="arenaReveal" class="ghost">打开提示词文件</button>
+            <button id="arenaAutoOff" class="btn-danger" hidden>立即关闭无人值守写入</button>
+          </div>
+          <div id="arenaClip" class="arena-clip"></div>
+          <!-- Pairing requests are shown HERE, not on the 待办 page. 待办 lists write approvals
+               (file patches); a pairing request is a different entity that arrives before any
+               write exists. The old instructions told the operator to approve a pairing in
+               待办, where it never appears — so a real request looked like it never arrived. -->
+          <div id="arenaPairRequests" class="arena-pair"></div>
+          <ol class="arena-steps">
+            <li>在 Arena 对话框里直接 <strong>Ctrl+V</strong> 粘贴并发送。</li>
+            <li>Agent 会报出一个 pair_id，然后停下等你（提示词里写明了这一点）。</li>
+            <li>下面出现配对请求后，点它旁边的<strong>批准</strong>（本页会每秒自动刷新）。</li>
+            <li>回 Arena 告诉它「已批准」，它会自己完成握手并汇报读到的内容。</li>
+          </ol>
+          <p class="muted">关机 / 关闭窗口 / 点「断开」都会立刻停止隧道。配对码是一次性的，30 分钟内有效。</p>
+        </div>
+
+        <div id="arenaBusy" class="arena-card" hidden>
+          <p id="arenaBusyText">正在建立隧道（首次会下载 cloudflared，约 35 MB）…</p>
+          <p class="muted">这一步可能要一两分钟。期间不要把窗口关掉。</p>
+        </div>
+      </section>
+
+      <section data-view="activity" class="view">
+        <div class="view-head"><span class="muted">来自 bridge 自己的审计日志。远端 Agent 的自述不算证据，这里才是。</span></div>
+        <div id="timeline"></div>
+      </section>
+
+      <section data-view="files" class="view">
+        <div class="view-head">
+          <span class="muted" id="fileLabel">选择左侧文件查看内容</span>
+        </div>
+        <div id="fileView" class="fileview"><div class="tree-empty">尚未选择文件</div></div>
+      </section>
+
+      <section data-view="grants" class="view">
+        <div class="view-head"><span class="muted">当前远端能做什么。ask / plan 只读；code 可写但每次都需要你在待办里批准。</span></div>
+        <div id="grantList"></div>
+      </section>
+
+      <section data-view="events" class="view">
+        <div class="view-head">
+          <button id="evRefresh" class="ghost">刷新</button>
+          <span class="muted">已脱敏：只含摘要与哈希，不含文件正文或凭据</span>
+        </div>
+        <pre id="events"></pre>
+      </section>
+    </div>
+  </main>
+
+  <!-- Right: run inspector. Mirrors the selected run's tool calls, so the operator
+       can watch the remote agent work without leaving the approval surface. -->
+  <aside id="inspector">
+    <div class="pane-head"><span>运行检查器</span></div>
+    <div id="inspectorBody"><div class="tree-empty">选择一条运行查看详情</div></div>
+  </aside>
+
+</div>
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
