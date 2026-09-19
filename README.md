@@ -24,7 +24,9 @@ ArenaBridge 是一个本地 MCP Bridge。远端 Agent（Arena Agent、WorkBuddy�
 
 ### 方式一：自包含发布包（推荐，零依赖）
 
-下载 `arena-bridge-<version>-win-x64.zip`，解压到任意目录，**双击 `desktop.cmd`**。
+到 **[Releases](https://github.com/zty828/Arena-Agent/releases)** 下载 `arena-bridge-<version>-win-x64.zip`，解压到任意目录，**双击 `desktop.cmd`**。
+
+> 当前发布的是 **pre-release**（`0.1.0-stage1`）：能跑、但**不是生产就绪**，请先读下面的「安全边界」与「当前验收结论」。
 
 压缩包内含 Node 22 运行时、Electron、cloudflared 和全部 npm 依赖，因此：
 
@@ -35,8 +37,8 @@ ArenaBridge 是一个本地 MCP Bridge。远端 Agent（Arena Agent、WorkBuddy�
 ### 方式二：克隆源码
 
 ```bash
-git clone <your-fork-url>
-cd arena-bridge
+git clone https://github.com/zty828/Arena-Agent.git
+cd Arena-Agent
 npm install
 ```
 
