@@ -4,6 +4,10 @@
   "private": true,
   "description": "ArenaBridge: an auditable local MCP workspace bridge. A remote model reaches this machine's files through a supervised, revocable, fully logged bridge instead of getting a shell.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zty828/Arena-Bridge.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.22.2 <23"
