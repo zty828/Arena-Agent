@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -116,6 +117,11 @@ ACCESS_MODES = ["ask", "plan", "code", "exec"]
 # text file. Bounded on purpose: the point is to stop "the root has no files" from reading as
 # "the workspace is empty", not to walk the tree.
 SUBDIR_SCAN_LIMIT = 8
+
+# Tool calls that change state, and therefore must not be silently retried: apply_patch,
+# edit_file, run_command, set_todos, report_progress. Every other tool is read-only and keeps
+# the default retry budget, which is what lets a stalled tunnel read recover (see STALL_DEADLINE).
+SIDE_EFFECTING_TOOLS = {"apply_patch", "edit_file", "run_command", "set_todos", "report_progress"}
 
 # Mirrors GRANT_NO_EXPIRY_AT in the policy engine. A session-scoped grant carries this instead of
 # a deadline, so the value stays a number and every server-side comparison stays numeric.
@@ -198,8 +204,15 @@ def http_json(method: str, url: str, body: dict | None = None, headers: dict | N
             # The connection never completed. Retrying is only safe when the server could
             # not have acted, so callers pass attempts=1 for side-effecting calls.
             last_error = error
-            reason = str(getattr(error, "reason", error))
-            if time.monotonic() - started >= max(1.0, deadline - 0.5) and "timed out" in reason.lower():
+            reason = getattr(error, "reason", error)
+            # A stall is a timeout by type, not by message: ConnectionResetError and SSL-wrapped
+            # timeouts never contain the literal "timed out", so substring matching misreported
+            # them as "check the address/firewall" and burned the retry budget on the wrong hint.
+            # Match TimeoutError/socket.timeout instead (socket.timeout is an alias of TimeoutError
+            # since 3.10, and urllib wraps read timeouts in URLError.reason), and treat any attempt
+            # that burned the whole stall deadline as stalled whatever the reason text says.
+            if (isinstance(error, (TimeoutError, socket.timeout)) or isinstance(reason, (TimeoutError, socket.timeout))
+                    or time.monotonic() - started >= max(1.0, deadline - 0.5)):
                 stalled = True
             if attempt + 1 < max(1, tries):
                 time.sleep(min(4, 0.5 * (2 ** attempt)))
@@ -365,7 +378,10 @@ def do_call(args: argparse.Namespace) -> None:
         die(f"arguments must be a JSON object: {error}")
     client = Client(base_url(), token())
     client.era = MODERN
-    result = client.rpc("tools/call", {"name": args.tool, "arguments": arguments}, attempts=1)
+    # attempts=1 only where a retry could apply the change twice (SIDE_EFFECTING_TOOLS); a
+    # read-only call keeps the default retry budget so a stalled tunnel read is retried.
+    attempts = 1 if args.tool in SIDE_EFFECTING_TOOLS else None
+    result = client.rpc("tools/call", {"name": args.tool, "arguments": arguments}, attempts=attempts)
     structured = structured_of(result)
     payload = {
         "ok": bool(structured.get("ok", not result.get("isError", False))),
@@ -501,7 +517,11 @@ def do_pair_request(args: argparse.Namespace) -> None:
     })
     if status >= 400:
         die(f"pairing request rejected (HTTP {status}): {json.dumps(data, ensure_ascii=False)[:600]}")
-    save_state({"pair_id": data.get("pair_id"), "claim_secret": data.get("claim_secret")})
+    # `pairing_expires_at` is the deadline on the PENDING pairing, not on the grant. It is saved
+    # so `pair-claim` can tell "not approved yet, keep waiting" from "the pairing lapsed and the
+    # claim will now fail". The daemon omits it on APPROVED, so .get() stays.
+    save_state({"pair_id": data.get("pair_id"), "claim_secret": data.get("claim_secret"),
+                "pairing_expires_at": data.get("expires_at")})
     # The secret is printed as well as saved. A sandbox that resets /tmp between turns loses the
     # state file, and `pair-claim` cannot then recover the secret — the pairing would have to be
     # minted again and the operator would have to approve a second time. Printing it lets the
@@ -523,16 +543,35 @@ def do_pair_claim(args: argparse.Namespace) -> None:
     if not pair_id or not secret:
         die("pair_id and claim_secret are required (or run pair-request first).")
     status, data = http_json("POST", base_url() + "/pair/claim", {"pair_id": pair_id, "claim_secret": secret})
+    # The claim must not die with HTTP 4xx on a pairing that was PENDING and has since lapsed:
+    # the daemon answers AUTHORIZATION_REQUIRED for that, and "claim rejected / wrong secret"
+    # would send the operator debugging a value that is fine — the code simply expired. Detect it
+    # from the deadline saved by pair-request and say so distinctly (same exit code as before).
     if status >= 400:
-        die(f"claim rejected (HTTP {status}): {json.dumps(data, ensure_ascii=False)[:600]}")
+        message = json.dumps(data, ensure_ascii=False)[:600]
+        if "AUTHORIZATION_REQUIRED" in message:
+            pairing_expires_at = state.get("pairing_expires_at")
+            if isinstance(pairing_expires_at, (int, float)) and not isinstance(pairing_expires_at, bool) \
+                    and time.time() * 1000 >= pairing_expires_at:
+                die("pairing EXPIRED: the pairing code was never approved before its deadline. "
+                    "Run pair-request again with a fresh code — this is not a wrong claim secret.")
+        die(f"claim rejected (HTTP {status}): {message}")
     if data.get("state") != "approved":
+        # A PENDING response carries `expires_at` (epoch ms) since the parallel daemon change;
+        # .get() keeps older daemons working. When it is known, say how long the operator has.
+        pending_expires_at = data.get("expires_at")
         print(json.dumps({"ok": False, "state": data.get("state"),
-                          "hint": "The local operator has not approved this pairing yet."}, ensure_ascii=False, indent=2))
+                          "expires_at": pending_expires_at,
+                          "expires_in": expires_in(pending_expires_at),
+                          "hint": ("The local operator has not approved this pairing yet."
+                                   if not isinstance(pending_expires_at, (int, float)) or isinstance(pending_expires_at, bool)
+                                   else f"The local operator has not approved this pairing yet; they have {expires_in(pending_expires_at)} left.")},
+                         ensure_ascii=False, indent=2))
         sys.exit(2)
     # The challenge is kept as well, so `agent-check` can complete the handshake on its own:/n    # the claim is the only place it is handed out, and a command whose whole job is "confirm
     # the grant works" must not depend on the caller remembering a value from an earlier step.
     save_state({"token": data.get("token"), "run_id": data.get("run_id"), "workspace_id": data.get("workspace_id"),
-                "challenge": data.get("challenge")})
+                "challenge": data.get("challenge"), "pairing_expires_at": None})
     # The token is printed as well as saved, for the same reason the claim secret is: a sandbox
     # that discards /tmp between turns would otherwise lose the only copy of the credential, and
     # the whole pairing would have to be minted and approved again. It is a live credential —

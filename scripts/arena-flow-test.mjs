@@ -88,9 +88,15 @@ try {
   }
   if (!ready) throw new Error('daemon did not become ready; see ' + path.relative(root, path.join(state, 'daemon.err.log')));
   const admin = ready.urls.admin;
-  const port = new URL(ready.urls.mcp).port;
+  // The ingress listener is reported under `mcp_remote`, not `mcp`. Reading `urls.mcp` took the
+  // LOOPBACK listener's port and then dialled it over the global address, which cannot work: the
+  // loopback socket never accepts a connection addressed to this machine's global IPv6, so every
+  // step below failed with a connection error rather than a bridge refusal. `mcp` remains the
+  // fallback for a build that exposes the remote listener under the old key.
+  const remote = ready.urls.mcp_remote || ready.urls.mcp;
+  const port = new URL(remote).port;
   mcpUrl = `http://[${address}]:${port}`;
-  check('bridge is bound for remote ingress', ready.urls.mcp.includes('::') || ready.urls.mcp.includes(address), ready.urls.mcp);
+  check('bridge is bound for remote ingress', remote.includes('::') || remote.includes(address), remote);
 
   // Step 1: the agent fetches the client over the network, exactly as the prompt says.
   // Python rather than curl: a sandbox http_proxy breaks curl against a raw IPv6 literal.

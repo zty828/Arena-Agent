@@ -24,8 +24,16 @@
  * Nothing in this module executes anything. `scripts/` is a read-only directory of files: a
  * skill can describe a command, it cannot run one, and it cannot authorise one.
  */
+import { randomBytes } from 'node:crypto';
+import { constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+
+/**
+ * Read flags that refuse to open through a final-component link. O_NOFOLLOW does not exist on
+ * Windows, so it is dropped there — the same compromise the workspace-tools reads make.
+ */
+const OPEN_NOFOLLOW = constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW);
 
 export const SKILL_FILENAME = 'SKILL.md';
 /** Bounds. A skill is meant to be small and human-authored; these stop a hostile one being a wedge. */
@@ -93,9 +101,12 @@ function scalar(raw: string): string {
 export function parseFrontmatter(text: string): { fields: Record<string, string>; nested: Record<string, Record<string, string>>; body: string; error?: string } {
   const normalised = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
   if (!normalised.startsWith('---\n') && normalised.trimStart().startsWith('---')) {
-    // Tolerate a leading blank line before the fence.
+    // Tolerate a leading blank line before the fence. The recursion must only happen when the
+    // trim actually removed something: when there is no leading whitespace to strip ('---',
+    // '--- junk'), recursing on the identical string would loop until the stack overflows. When
+    // nothing was trimmed, fall through to the missing-frontmatter error instead.
     const trimmed = normalised.replace(/^\s+/, '');
-    return parseFrontmatter(trimmed);
+    if (trimmed.length < normalised.length) return parseFrontmatter(trimmed);
   }
   if (!normalised.startsWith('---\n')) return { fields: {}, nested: {}, body: normalised, error: 'missing YAML frontmatter: the file must start with a --- line' };
   const end = normalised.indexOf('\n---', 3);
@@ -121,7 +132,7 @@ export function parseFrontmatter(text: string): { fields: Record<string, string>
     blockKey = null; blockMode = null; blockLines = [];
   };
 
-  for (const line of lines) {
+  for (const [index, line] of lines.entries()) {
     if (blockMode) {
       const indent = line.length - line.trimStart().length;
       if (line.trim() === '') { blockLines.push(''); continue; }
@@ -161,8 +172,9 @@ export function parseFrontmatter(text: string): { fields: Record<string, string>
     if (blockIndicator) {
       currentParent = null;
       blockKey = key; blockMode = blockIndicator[1] as '|' | '>'; blockIndent = -1; blockLines = [];
-      // The block's indentation is taken from its first non-empty line.
-      const index = lines.indexOf(line);
+      // The block's indentation is taken from its first non-empty line. The current loop index
+      // anchors the scan: lines.indexOf(line) would find the FIRST occurrence of the header, so
+      // a duplicated line earlier in the frontmatter would read the wrong block's indentation.
       for (const candidate of lines.slice(index + 1)) {
         if (candidate.trim() === '') continue;
         blockIndent = candidate.length - candidate.trimStart().length;
@@ -209,6 +221,30 @@ export function nameProblems(name: string, directoryName: string): string[] {
 }
 
 export interface ParsedSkill { record: SkillRecord; problems: string[] }
+
+/**
+ * Opens a path so the check and the read are the same open — the lstat-then-read pair has a
+ * window in which the path can be swapped for a link, so the open itself refuses links
+ * (O_NOFOLLOW where it exists) and the buffer comes through the file handle. Mirrors the
+ * workspace-tools readBytes pattern. Throws when the file exceeds the cap; truncates safely when
+ * it is within the cap but grew between stat and read.
+ */
+async function readNoFollow(file: string, cap: number): Promise<{ buffer: Buffer; truncated: boolean }> {
+  const handle = await fs.open(file, OPEN_NOFOLLOW);
+  try {
+    // The stat is on the opened file, not on the path, so a swap of the path between open and
+    // stat cannot change what is being measured.
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error('not a regular file');
+    if (stat.size > cap) throw new Error(`file exceeds ${cap} bytes`);
+    // stat.size came from this same handle, so readFile(handle) can only exceed the cap if the
+    // file grew mid-read; the subarray keeps the answer inside the budget in that case.
+    const buffer = await handle.readFile();
+    return { buffer: buffer.subarray(0, cap), truncated: buffer.length > cap };
+  } finally {
+    await handle.close();
+  }
+}
 
 /** Reads one skill directory. Never follows a symlink, in either the directory or its files. */
 export async function readSkillDirectory(directory: string, rootIndex: number): Promise<{ skill?: ParsedSkill; problem?: SkillProblem }> {
@@ -372,7 +408,16 @@ export class SkillRegistry {  private skills = new Map<string, ParsedSkill>();
   async read(name: string): Promise<{ skill: SkillListing; body: string; files: string[]; truncated: boolean } | null> {
     const entry = this.skills.get(name);
     if (!entry) return null;
-    const text = await fs.readFile(path.join(entry.record.directory, SKILL_FILENAME), 'utf8');
+    // Re-read with the same discipline as discovery: the directory can have been tampered with
+    // since discover() ran, so the size cap is enforced before reading and the open refuses a
+    // link swapped in for SKILL.md. A tampered or unreadable file is reported as missing rather
+    // than served or thrown.
+    let text: string;
+    try {
+      text = (await readNoFollow(path.join(entry.record.directory, SKILL_FILENAME), SKILL_MAX_FILE_BYTES)).buffer.toString('utf8');
+    } catch {
+      return null;
+    }
     const parsed = parseFrontmatter(text);
     const body = parsed.body;
     const truncated = Buffer.byteLength(body, 'utf8') > SKILL_MAX_BODY_BYTES;
@@ -397,11 +442,16 @@ export class SkillRegistry {  private skills = new Map<string, ParsedSkill>();
     const base = path.resolve(entry.record.directory);
     if (target !== base && !target.startsWith(base + path.sep)) return null;
     if (!entry.record.files.includes(relative.split(path.sep).join('/'))) return null;
-    const stat = await fs.lstat(target);
-    if (!stat.isFile() || stat.isSymbolicLink()) return null;
-    const truncated = stat.size > SKILL_MAX_FILE_BYTES;
-    const buffer = truncated ? (await fs.readFile(target)).subarray(0, SKILL_MAX_FILE_BYTES) : await fs.readFile(target);
-    return { path: relative.split(path.sep).join('/'), text: buffer.toString('utf8'), truncated };
+    // The open itself refuses a link and the read goes through the handle, so a concurrent
+    // swap between check and read cannot redirect the read outside the skill tree — the
+    // lstat-then-read pair this replaces had that window.
+    let read: { buffer: Buffer; truncated: boolean };
+    try {
+      read = await readNoFollow(target, SKILL_MAX_FILE_BYTES);
+    } catch {
+      return null;
+    }
+    return { path: relative.split(path.sep).join('/'), text: read.buffer.toString('utf8'), truncated: read.truncated };
   }
 }
 
@@ -441,9 +491,16 @@ async function copyTree(from: string, to: string, budget = { remaining: SKILL_MA
     if (entry.isDirectory()) { copied += await copyTree(source, target, budget); continue; }
     if (!entry.isFile()) throw new Error(`contains something that is not a file: ${entry.name}`);
     if (budget.remaining-- <= 0) throw new Error(`more than ${SKILL_MAX_FILES} files`);
-    const stat = await fs.lstat(source);
-    if (stat.size > SKILL_MAX_FILE_BYTES) throw new Error(`file exceeds ${SKILL_MAX_FILE_BYTES} bytes: ${entry.name}`);
-    await fs.copyFile(source, target);
+    // The lstat/copyFile pair this replaces could be redirected by a link swapped in between the
+    // two calls; opening O_NOFOLLOW and copying through the handle makes the check and the read
+    // the same open. The size cap is enforced inside readNoFollow, before the read.
+    let buffer: Buffer;
+    try {
+      ({ buffer } = await readNoFollow(source, SKILL_MAX_FILE_BYTES));
+    } catch (error) {
+      throw new Error(`cannot copy ${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await fs.writeFile(target, buffer);
     copied++;
   }
   return copied;
@@ -470,11 +527,24 @@ export async function installSkillFromDirectory(source: string, root: string): P
   if (!destination) return { ok: false, reason: `refusing to install outside the skills root: ${skill.record.name}` };
   if (await fs.lstat(destination).then(() => true).catch(() => false)) return { ok: false, reason: `a skill named "${skill.record.name}" is already installed` };
 
-  const staging = path.join(path.resolve(root), `.installing-${skill.record.name}-${Date.now().toString(36)}`);
+  // The staging suffix is random, not time-based: Date.now() collides for two installs started
+  // in the same millisecond, and a shared staging directory would interleave their files.
+  const staging = path.join(path.resolve(root), `.installing-${skill.record.name}-${randomBytes(6).toString('hex')}`);
   await fs.mkdir(path.resolve(root), { recursive: true });
   try {
     const files = await copyTree(sourcePath, staging);
-    await fs.rename(staging, destination);
+    try {
+      await fs.rename(staging, destination);
+    } catch (error) {
+      // The pre-check above is a TOCTOU hint only — the rename is the authoritative conflict
+      // point, so a skill that appeared after the check (or a destination with anything in it)
+      // fails here with the conflict the operator actually has to resolve.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EPERM') {
+        throw new Error(`a skill named "${skill.record.name}" is already installed`);
+      }
+      throw error;
+    }
     return { ok: true, name: skill.record.name, files };
   } catch (error) {
     await fs.rm(staging, { recursive: true, force: true }).catch(() => {});

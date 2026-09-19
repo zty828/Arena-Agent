@@ -186,8 +186,13 @@ try {
   // The sandbox client wraps the tool result: {ok, result:{ok, data:{preview, approval_id, state}}}.
   // Reading the wrong level here would silently look like "the agent did nothing", so the
   // envelope is unwrapped explicitly and a malformed shape is reported as such.
+  // The sandbox client unwraps the tool envelope twice: `data` at the top level carries the
+  // tool's own fields, and `result` appears only when there is no envelope to unwrap (a raw or
+  // legacy transport, and the error path). Reading only `result.data` therefore found nothing on
+  // every successful call, and the whole write cycle below degraded to "the agent did nothing".
+  // Both shapes are accepted, the same way arena-flow-test.mjs / write-cycle-e2e.mjs read theirs.
   const previewEnvelope = JSON.parse(previewCall.stdout);
-  const previewData = previewEnvelope?.result?.data;
+  const previewData = previewEnvelope?.data ?? previewEnvelope?.result?.data;
   check('the remote agent parked a write request', previewData?.state === 'waiting_for_approval',
     previewData?.state ?? previewCall.stdout.slice(0, 200));
   const patchId = previewData?.preview?.id;
@@ -219,10 +224,13 @@ try {
 
   const applyCall = client(['call', 'apply_patch', JSON.stringify({ action: 'apply', patch_id: patchId, approval_id: approvalId })]);
   const applyEnvelope = JSON.parse(applyCall.stdout);
-  const applyData = applyEnvelope?.result?.data;
+  // Same two-shape unwrap as the preview above: `ok` sits at the top level on success and under
+  // `result` on the raw/error shape.
+  const applyData = applyEnvelope?.data ?? applyEnvelope?.result?.data;
+  const applyOk = applyEnvelope?.ok === true || applyEnvelope?.result?.ok === true;
   // When the write fails, the tool result alone says IO_ERROR and nothing else, which is not
   // enough to act on. Read the bridge's own diagnostic log and surface the underlying reason.
-  if (applyEnvelope?.result?.ok !== true) {
+  if (!applyOk) {
     console.log('      apply stdout:', applyCall.stdout.slice(0, 600));
     // Events carry `type` and `payload`; the earlier attempt printed undefined for both.
     const events = await (await fetch(`${adminUrl}/admin/v1/events?after=0`, { headers: adminAuth })).json();
@@ -230,7 +238,7 @@ try {
     console.log('      recent events:\n        ' + recent.join('\n        '));
   }
   check('the write succeeds only after the window approved it',
-    applyEnvelope?.result?.ok === true && applyData?.patch?.state === 'applied',
+    applyOk && applyData?.patch?.state === 'applied',
     applyData?.patch?.state ?? applyCall.stdout.slice(0, 300));
 
   // --- 6. the file really changed ------------------------------------------------------

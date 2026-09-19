@@ -63,6 +63,15 @@ function* buffered(completion:Completion,includeUsage:boolean):Generator<string>
   if(includeUsage&&completion.usage)yield `data: ${JSON.stringify({...info,object:'chat.completion.chunk',choices:[],usage:completion.usage})}\n\n`;
   yield 'data: [DONE]\n\n';
 }
+// Same streaming-budget style as boundedText/sseData in adapters.ts: count bytes as they arrive
+// and abort the moment the budget is exceeded. Buffering first (request.text()) would let an
+// authenticated client exhaust memory with a multi-GB body before any limit check could run.
+async function boundedRequestText(request:Request,max=1048576):Promise<string>{
+  if(!request.body)return '';
+  const reader=request.body.getReader(),decoder=new TextDecoder('utf-8');let size=0,text='';
+  try{for(;;){const part=await reader.read();if(part.done){text+=decoder.decode();break;}size+=part.value.length;if(size>max)throw new BridgeError('RESOURCE_LIMIT',413,'Request exceeds byte budget');text+=decoder.decode(part.value,{stream:true});}return text;}
+  finally{await reader.cancel().catch(()=>undefined);reader.releaseLock();}
+}
 function streamResponse(iterator:AsyncGenerator<string,unknown>,headers:HeadersInit,onCancel:()=>void,signal?:AbortSignal):Response{
   const encoder=new TextEncoder();let ended=false,streamController:ReadableStreamDefaultController<Uint8Array>|undefined;
   const detach=()=>signal?.removeEventListener('abort',aborted);
@@ -123,13 +132,16 @@ export class ProviderGateway {
   async handle(request:Request,principal:Principal):Promise<Response>{
     try{
       if(principal.kind!=='api_client')throw new BridgeError('POLICY_DENIED',403,'This identity is not an authenticated model API client');
-      const route=new URL(request.url).pathname;
+      // A relative/garbage request URL makes new URL() throw a bare TypeError, which the generic
+      // catch below would misreport as 503 UPSTREAM_UNAVAILABLE — a routing problem, not a backend
+      // outage, so it is pinned to 400 here.
+      let route:string;try{route=new URL(request.url).pathname;}catch{throw new BridgeError('INVALID_ARGUMENT',400,'Request URL is malformed or not absolute');}
       if(request.method==='GET'&&route==='/v1/models')return Response.json(await this.models(),{headers:{'Cache-Control':'no-store','X-ArenaBridge-Execution-Owner':'client'}});
       if(request.method==='GET'&&route==='/readyz'){const ready=await this.ready();return Response.json({ready,production_ready:false,reason:this.healthState.reason},{status:ready?200:503,headers:{'Cache-Control':'no-store'}});}
       if(route==='/v1/responses'||route==='/v1/messages') throw new BridgeError('UNSUPPORTED_PROTOCOL',422,'unsupported_protocol: only Chat Completions is implemented');
       if(request.method!=='POST'||route!=='/v1/chat/completions')throw new BridgeError('NOT_FOUND',404,'No model gateway route');
       if(!request.headers.get('content-type')?.toLowerCase().startsWith('application/json'))throw new BridgeError('INVALID_ARGUMENT',415,'Content-Type must be application/json');
-      const raw=await request.text();if(Buffer.byteLength(raw)>1048576)throw new BridgeError('RESOURCE_LIMIT',413,'Request exceeds byte budget');
+      const raw=await boundedRequestText(request);
       // 后端缺席时必须先答 503：否则无网关时会把「没有可用推理后端」误报成请求体非法，
       // 调用方会去修 payload 而不是修配置。适配器存在后才做契约校验。
       if(!this.adapter)throw new BridgeError('UPSTREAM_UNAVAILABLE',503,'No approved inference backend is configured');

@@ -1,15 +1,15 @@
 /**
  * Renderer for the ArenaBridge desktop harness.
  *
- * It holds no privilege: every action is an existing admin-API call, and the write
- * actions are the same approve/deny endpoints the browser console uses. The token is
- * handed over once by the preload bridge and kept in memory, never in storage.
+ * It holds no privilege: every action is an IPC call to the main process, which owns the
+ * daemon's admin token and proxies the admin-API operations (see the admin:* wrappers on
+ * window.bridgeHost). No credential ever reaches this page.
  */
 'use strict';
 
 const $ = (id) => document.getElementById(id);
 const S = {
-  base: '', token: '', prefs: { workspaceRoot: '', recentRoots: [] },
+  base: '', prefs: { workspaceRoot: '', recentRoots: [] },
   workspaces: [], runs: [], approvals: [], events: [],
   selectedRun: null, selectedFile: null, diffCache: new Map(), notified: new Set(),
   // Signature of the last rendered root listing, so the poll can tell "unchanged" from "changed"
@@ -50,15 +50,36 @@ const tierLabel = (mode) => TIER_LABELS[mode] ?? (mode || '?');
  */
 const isDirectoryEntry = (entry) => ['directory', 'dir'].includes(String(entry?.type ?? entry?.kind ?? '').toLowerCase());
 
+/**
+ * The one admin-API operation this page still needs: listing workspace data, file contents,
+ * approvals, pairings and events. Every call is proxied by the main process, which injects the
+ * admin token there — the token never crosses into this page, so a workspace switch or a tunnel
+ * restart can no longer strand the window on a dead credential.
+ *
+ * The self test swaps this for a mock to observe what the pairing panel sends, which is why
+ * the mockable indirection is kept rather than calling window.bridgeHost inline everywhere.
+ */
 async function api(path, options = {}) {
-  const response = await fetch(S.base + path, {
-    ...options,
-    headers: { Authorization: 'Bearer ' + S.token, 'Content-Type': 'application/json', ...(options.headers || {}) },
-  });
-  const text = await response.text();
-  let data; try { data = text ? JSON.parse(text) : undefined; } catch { data = text; }
-  if (!response.ok) throw new Error((data && data.error && (data.error.code + ': ' + data.error.message)) || ('HTTP ' + response.status));
-  return data;
+  const call = api.bridgeCall || ((op, ...args) => window.bridgeHost[op](...args));
+  const body = options.body ? JSON.parse(options.body) : {};
+  switch (path) {
+    case '/admin/v1/workspace/tree?path=.': return call('adminWorkspaceTree', '.');
+    case '/admin/v1/status': return call('adminStatus');
+    case '/admin/v1/events?after=0': return call('adminEvents', 0);
+    default: break;
+  }
+  let m = /^\/admin\/v1\/workspace\/tree\?path=([^&]*)$/.exec(path);
+  if (m) return call('adminWorkspaceTree', decodeURIComponent(m[1]));
+  m = /^\/admin\/v1\/workspace\/file\?path=([^&]*)$/.exec(path);
+  if (m) return call('adminWorkspaceFile', decodeURIComponent(m[1]));
+  m = /^\/admin\/v1\/approvals\/([^/]+)\/decision$/.exec(path);
+  if (m) return call('adminApprovalDecision', decodeURIComponent(m[1]), body.approve === true);
+  m = /^\/admin\/v1\/workspaces\/([^/]+)\/patches\/([^/]+)$/.exec(path);
+  if (m) return call('adminPatchPreview', decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+  m = /^\/admin\/v1\/pairings\/([^/]+)\/decision$/.exec(path);
+  if (m) return call('adminPairingDecision', decodeURIComponent(m[1]), body.approve === true, body.access_mode);
+  if (path === '/admin/v1/revoke-all') return call('adminRevokeAll');
+  throw new Error('unsupported admin operation: ' + path);
 }
 
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -67,6 +88,22 @@ const short = (v, n = 20) => String(v ?? '').slice(0, n);
 const clockOf = (ms) => new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
 const timeOf = (iso) => { const d = Date.parse(iso); return isNaN(d) ? '--:--:--' : clockOf(d); };
 const baseName = (p) => String(p ?? '').split(/[\\/]/).filter(Boolean).pop() || p;
+
+/**
+ * Applies a bootstrap payload (daemon URLs + workspace prefs) to the session state.
+ *
+ * Every daemon restart — workspace switch, arena connect/disconnect — rotates the admin token
+ * and re-picks the OS-assigned ports, so the IPC that caused the restart returns this payload
+ * and it must be applied before anything else polls. Skipping it was survivable only while
+ * the token came from bootstrap() and the renderer re-fetched it; with the token now confined
+ * to the main process, stale prefs are the remaining symptom and this is the one place they
+ * get replaced.
+ */
+function applyBoot(boot) {
+  if (!boot || typeof boot !== 'object') return;
+  S.base = boot.adminUrl || '';
+  S.prefs = boot.prefs || S.prefs;
+}
 
 let toastTimer = null;
 function toast(message, bad = false) {
@@ -126,6 +163,10 @@ function renderTree(entries, container, prefix) {
     } else {
       const btn = document.createElement('button');
       btn.className = 'node' + (S.selectedFile === entry.path ? ' active' : '');
+      // The full relative path goes on the node itself. The active-highlight in openFile()
+      // compares against this, never against the rendered text: `endsWith(basename)` marked
+      // every same-named file in the tree active at once.
+      btn.dataset.path = entry.path;
       btn.style.paddingLeft = indent + 'px';
       btn.innerHTML = '<span class="glyph">·</span><span class="nm">' + esc(entry.name) + '</span>';
       btn.onclick = () => openFile(entry.path);
@@ -184,7 +225,7 @@ async function loadTree(options = {}) {
 
 async function openFile(relativePath) {
   S.selectedFile = relativePath;
-  for (const n of document.querySelectorAll('#tree .node')) n.classList.toggle('active', n.textContent.trim().endsWith(baseName(relativePath)) && !n.classList.contains('dir'));
+  for (const n of document.querySelectorAll('#tree .node')) n.classList.toggle('active', n.dataset.path === relativePath && !n.classList.contains('dir'));
   switchView('files');
   $('fileLabel').textContent = relativePath;
   const host = $('fileView');
@@ -263,12 +304,19 @@ function renderPending() {
   }
 
   for (const item of items) {
-    const patchId = /patch_[a-z0-9-]+/i.exec(item.description || '');
+    // Prefer the structured patch_id the daemon now stores on the approval itself. The
+    // description regex survives only as a fallback for approvals created before that field
+    // existed — and if NEITHER yields an id, say so explicitly: the old code just skipped the
+    // item, which left the "正在读取 diff…" placeholder spinning forever.
+    const patchId = typeof item.patch_id === 'string' && item.patch_id
+      ? item.patch_id
+      : (/patch_[a-z0-9-]+/i.exec(item.description || '') || [])[0] || null;
     const holder = $('diff-' + item.id);
-    if (!patchId || !holder) continue;
+    if (!holder) continue;
+    if (!patchId) { holder.innerHTML = '<div class="ln">无法定位补丁编号（patch id），diff 未加载</div>'; continue; }
     const wsId = resolveWorkspaceFor(item);
     if (!wsId) { holder.innerHTML = '<div class="ln">无法确定工作区</div>'; continue; }
-    fetchDiff(patchId[0], wsId).then((preview) => {
+    fetchDiff(patchId, wsId).then((preview) => {
       if (!preview || !preview.changes) { holder.innerHTML = '<div class="ln">diff 不可用（补丁可能已被清理）</div>'; return; }
       holder.innerHTML = preview.changes.map((c) => '<div class="fname">' + esc(c.path) + '</div>' + diffHtml(c.diff)).join('');
     });
@@ -585,16 +633,20 @@ $('arenaStart').onclick = async () => {
   try {
     const result = await window.bridgeHost.arenaConnect(accessMode);
     if (!result.ok) {
+      // The failure may STILL have restarted the daemon: anything that failed after the tunnel
+      // came up unwinds through disconnectArena(), which re-boots the bridge loopback-only and
+      // rotates the token/ports. The fresh bootstrap rides in the result; apply it before any
+      // further poll, or the window keeps hitting the dead endpoints forever.
+      applyBoot(result.boot);
       arenaShowPanel('idle');
       if (result.cancelled) { toast('已取消，没有开放任何东西'); return; }
       toast(result.error || '连接失败', true);
       if (result.hint) $('arenaWs').textContent = result.hint;
       return;
     }
-    // The daemon was restarted to accept the tunnel host, so the admin token changed and
-    // every cached URL is stale. Re-read it before showing anything as live.
-    const boot = await window.bridgeHost.bootstrap();
-    S.base = boot.adminUrl; S.token = boot.token; S.prefs = boot.prefs;
+    // The daemon was restarted to accept the tunnel host, so every cached URL and the prefs are
+    // stale. The fresh bootstrap rides in the result — apply it before showing anything as live.
+    applyBoot(result.boot);
     const state = await window.bridgeHost.arenaState();
     $('arenaCountdown').dataset.until = String(result.expiresAt || '');
     renderArenaState({ ...state, open: true });
@@ -621,9 +673,10 @@ $('arenaStop').onclick = async () => {
       autoState = { enabled: false, expiresAt: null };
       renderAutoApprove();
     }
-    await window.bridgeHost.arenaDisconnect();
-    const boot = await window.bridgeHost.bootstrap();
-    S.base = boot.adminUrl; S.token = boot.token;
+    const result = await window.bridgeHost.arenaDisconnect();
+    // The daemon was restarted (loopback-only) if the tunnel was actually open — fresh
+    // bootstrap state rides in the result rather than needing a second IPC round trip.
+    applyBoot(result && result.boot);
     $('arenaClip').hidden = true;
     renderArenaState(await window.bridgeHost.arenaState());
     toast('已断开，bridge 已回到只监听本机');
@@ -696,6 +749,11 @@ $('arenaReveal').onclick = async () => {
 // must not mean rebuilding the tunnel (new public URL + another exposure confirmation), so this
 // mints a fresh code against the session that is already open and copies its prompt.
 $('arenaReissue').onclick = async () => {
+  const btn = $('arenaReissue');
+  // Not re-entrant: minting a second code while the first request is in flight would leave two
+  // outstanding codes and race the clipboard write. Disabled until the request settles, in
+  // finally, so even a thrown error re-enables it.
+  btn.disabled = true;
   try {
     const result = await window.bridgeHost.arenaReissuePairing();
     if (!result.ok) { toast(result.error || '重新签发失败', true); return; }
@@ -704,6 +762,7 @@ $('arenaReissue').onclick = async () => {
     reportClipboard(result);
     toast('已签发新的配对码，提示词已复制；让远端从第 1 步重跑（隧道没断）');
   } catch (error) { toast(String(error && error.message ? error.message : error), true); }
+  finally { btn.disabled = false; }
 };
 
 let arenaTimer = null;
@@ -932,9 +991,21 @@ function switchView(view) {
 // ---------- workspace switching ----------
 
 async function applyWorkspace(result) {
-  if (!result || !result.changed) { if (result && result.error) toast(result.error, true); return; }
-  const boot = await window.bridgeHost.bootstrap();
-  S.base = boot.adminUrl; S.token = boot.token; S.prefs = boot.prefs;
+  // The daemon may have been restarted even when the switch FAILED: the failure path restores
+  // the previous workspace, which is a fresh daemon with fresh ports. The bootstrap payload
+  // rides in the result on both paths, so apply it before doing anything else — a failed
+  // switch otherwise left the window polling a dead bridge with no explanation.
+  if (result) applyBoot(result.boot);
+  if (!result || !result.changed) {
+    if (result && result.error) toast(result.error, true);
+    // The restore restart means the tree and pending list may be stale against the new daemon;
+    // refresh them so the window shows what the bridge actually serves now.
+    if (result && result.boot) {
+      await loadTree({ force: true }).catch(() => {});
+      await refreshPending().catch(() => {});
+    }
+    return;
+  }
   S.diffCache.clear(); S.selectedFile = null; S.notified.clear();
   renderWorkspace();
   $('fileView').innerHTML = '<div class="tree-empty">尚未选择文件</div>';
@@ -1000,7 +1071,7 @@ setInterval(() => { if (autoState.enabled) renderAutoApprove(); }, 1000);
 (async () => {
   try {
     const boot = await window.bridgeHost.bootstrap();
-    S.base = boot.adminUrl; S.token = boot.token; S.prefs = boot.prefs;
+    applyBoot(boot);
     renderWorkspace();
     await loadTree();
     await refreshPending();
@@ -1061,7 +1132,12 @@ if (new URLSearchParams(location.search).get('selfTest') === '1') {
       report.errors.push(String(error && error.message ? error.message : error));
     }
     check('the main process returned an admin URL', /^http:\/\/127\.0\.0\.1:\d+$/.test(S.base), S.base);
-    check('the main process returned a token', typeof S.token === 'string' && S.token.length >= 32, S.token ? S.token.length + ' chars' : 'missing');
+    // The admin token must NOT reach the page: bootstrap no longer carries one, and every
+    // admin-API call is proxied by the main process. If a token reappears here, the whole
+    // renderer-side token story (dead-token polling, token in devtools) is back.
+    const bootProbe = await window.bridgeHost.bootstrap();
+    check('bootstrap hands no admin token to the renderer', !('token' in (bootProbe || {})) && typeof S.token === 'undefined',
+      'token' in (bootProbe || {}) ? 'token present in the bootstrap payload' : 'absent');
     check('the workspace was reported', !!(S.workspaces[0] || S.prefs.workspaceRoot), S.workspaces[0] ? S.workspaces[0].display_name : S.prefs.workspaceRoot);
     const treeNodes = document.querySelectorAll('#tree .node').length;
     check('the file tree rendered', treeNodes > 0, treeNodes + ' node(s)');
@@ -1294,14 +1370,14 @@ if (new URLSearchParams(location.search).get('selfTest') === '1') {
       // (`code`/`plan` passed through, everything else became `ask`), so approving a request for
       // `exec` handed the remote a read-only grant. The operator clicked 批准 and saw success; the
       // remote reported `access_mode: "ask"`, which reads as "the exec tier never took effect".
-      const savedApi = api;
+      const savedBridgeCall = api.bridgeCall;
       const sent = [];
       try {
-        api = async (path, options) => {
-          if (path === '/admin/v1/status') {
+        api.bridgeCall = async (op, ...args) => {
+          if (op === 'adminStatus') {
             return { pairings: [{ pair_id: 'pair_probe', workspace_id: 'ws_probe', requested_access: 'exec', max_access: 'exec', expires_at: Date.now() + 60000, remote_label: 'probe' }] };
           }
-          sent.push({ path, body: options && options.body ? JSON.parse(options.body) : undefined });
+          sent.push({ op, args });
           return {};
         };
         await refreshArenaPairRequests();
@@ -1309,12 +1385,12 @@ if (new URLSearchParams(location.search).get('selfTest') === '1') {
         check('an exec pairing request offers an approve action', !!approveButton, approveButton ? 'present' : 'missing');
         approveButton?.click();
         await new Promise((resolve) => setTimeout(resolve, 50));
-        const decision = sent.find((call) => call.path.includes('/decision'));
+        const decision = sent.find((call) => call.op === 'adminPairingDecision');
         check('approving an exec request sends exec rather than a downgraded tier',
-          decision?.body?.access_mode === 'exec',
-          `access_mode=${JSON.stringify(decision?.body?.access_mode)} path=${JSON.stringify(decision?.path)}`);
+          decision?.args?.[2] === 'exec' && decision?.args?.[1] === true,
+          `op=${JSON.stringify(decision?.op)} args=${JSON.stringify(decision?.args)}`);
       } finally {
-        api = savedApi;
+        api.bridgeCall = savedBridgeCall;
         await refreshArenaPairRequests().catch(() => {});
       }
       // Prove the mode actually crosses the bridge, rather than reading a function's `.length`.

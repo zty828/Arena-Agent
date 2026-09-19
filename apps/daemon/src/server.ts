@@ -188,7 +188,7 @@ async function startDaemon(config:DaemonConfig,credentials:{adminToken:string;cl
   // that reads a url must therefore treat '' as "not listening" rather than "no value": ''
   // is truthy enough to survive `??` and only fails later, as an opaque `new URL('')`.
   const servers:Server[]=[],urls={api:'',mcp:'',mcp_remote:'',admin:''};
-  let openRequests=0,pairWindow=Date.now(),pairCount=0;
+  let openRequests=0;
   const ingress=config.remote_ingress;
   if(ingress.enabled&&!ingress.acknowledge_exposure)throw new BridgeError('INVALID_CONFIG',400,'remote_ingress.enabled requires acknowledge_exposure:true; exposing the workspace bridge is never implicit');
   if(ingress.enabled&&!ingress.require_grant)throw new BridgeError('INVALID_CONFIG',400,'remote_ingress cannot disable grant authentication');
@@ -202,6 +202,10 @@ async function startDaemon(config:DaemonConfig,credentials:{adminToken:string;cl
   const addressFor=(kind:'api'|'mcp'|'mcp_remote'|'admin')=>kind==='mcp_remote'?mcpAddress:'127.0.0.1';
   const makeServer=(kind:'api'|'mcp'|'mcp_remote'|'admin')=>{
     let port=0;
+    // The pairing rate limit is per listener: these counters used to live in createDaemon scope,
+    // so the mcp and mcp_remote surfaces shared one 20/minute budget and burned each other's
+    // allowance. Each listener now keeps its own window.
+    let pairWindow=Date.now(),pairCount=0;
     const allowedHosts=hostsFor(addressFor(kind),kind==='mcp_remote'&&ingress.enabled?ingress.allowed_hosts:[]);
     const server=createServer({maxHeaderSize:16384,requestTimeout:15000,headersTimeout:10000},(req,res)=>{
       void(async()=>{

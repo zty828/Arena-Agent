@@ -272,12 +272,18 @@ function renderPending() {
   }
   // Fill diffs asynchronously so the buttons appear immediately.
   for (const item of items) {
-    const patchId = /patch_[a-z0-9-]+/i.exec(item.description || '');
+    // Prefer the structured patch_id the server now stores on the approval. The description
+    // regex survives only as a fallback for approvals created before that field existed.
+    const structured = typeof item.patch_id === 'string' && item.patch_id ? item.patch_id : null;
+    const legacy = structured ? null : /patch_[a-z0-9-]+/i.exec(item.description || '');
+    const patchId = structured || (legacy && legacy[0]) || null;
     const host = $('diff-' + item.id);
-    if (!patchId || !host) continue;
+    if (!host) continue;
+    // An explicit dead end beats the perpetual '正在读取 diff…' placeholder.
+    if (!patchId) { host.innerHTML = '<div class="line muted">无法定位补丁编号（patch id），diff 未加载</div>'; continue; }
     const workspaceId = (host.closest('[data-workspace]') || {}).dataset?.workspace || '';
     if (!workspaceId) { host.innerHTML = '<div class="line muted">无法确定工作区，diff 未加载</div>'; continue; }
-    fetchDiff(patchId[0], workspaceId).then((preview) => {
+    fetchDiff(patchId, workspaceId).then((preview) => {
       if (!preview || !preview.changes) { host.innerHTML = '<div class="line muted">diff 不可用（补丁可能已被清理）</div>'; return; }
       host.innerHTML = preview.changes.map((change) =>
         '<div class="file">' + esc(change.path) + '</div>' + diffHtml(change.diff)
@@ -358,9 +364,27 @@ function describe(event) {
   return { label: entry[0], tone: entry[1], detail };
 }
 
+// The server caps each /admin/v1/events page at 100 rows; on a busy session a single after=0
+// fetch silently loses the oldest events (grant.issued among them). Page by the advertised seq
+// until a short page arrives, with a page cap so a misbehaving server cannot loop us forever.
+const EVENTS_PAGE_SIZE = 100;
+const EVENTS_MAX_PAGES = 50;
+async function fetchAllEvents() {
+  const events = [];
+  let after = 0;
+  for (let page = 0; page < EVENTS_MAX_PAGES; page++) {
+    const data = await api('/admin/v1/events?after=' + after);
+    const batch = data.events || [];
+    events.push(...batch);
+    if (batch.length < EVENTS_PAGE_SIZE) break;
+    after = Number(batch[batch.length - 1].seq);
+    if (!Number.isFinite(after)) break;
+  }
+  return events;
+}
+
 async function refreshActivity() {
-  const data = await api('/admin/v1/events?after=0');
-  const events = data.events || [];
+  const events = await fetchAllEvents();
   const byRun = new Map();
   for (const event of events) {
     const key = event.run_id || '__local__';
@@ -395,10 +419,12 @@ async function refreshGrants() {
   const now = Date.now();
   const rows = (status.workspaces || []);
   const grantHost = $('grantList');
-  // The authoritative grant list is the audit log: grants are issued per pairing.
-  const data = await api('/admin/v1/events?after=0');
+  // The authoritative grant list is the audit log: grants are issued per pairing. Page through
+  // the whole log — a single after=0 fetch silently drops the oldest grant.issued rows on a
+  // busy session and the tab would claim no grants exist while live ones do.
+  const events = await fetchAllEvents();
   const issued = new Map();
-  for (const event of data.events || []) {
+  for (const event of events) {
     if (event.type === 'grant.issued' && event.payload.grant_id) issued.set(event.payload.grant_id, { ...event.payload, at: event.timestamp });
     if (event.type === 'grants.revoked_all') for (const g of issued.values()) g.revoked = true;
     if (event.type === 'approval.consumed') { /* consumption is per-approval, not per-grant */ }

@@ -1,7 +1,7 @@
 /**
  * Preload bridge. The renderer gets a narrow, explicit API and nothing else —
- * no Node, no filesystem, no raw IPC channel names. The admin token crosses this
- * boundary once, at startup, and lives only in the renderer's memory.
+ * no Node, no filesystem, no raw IPC channel names. The admin token never crosses this
+ * boundary at all: every admin-API call is proxied by the main process, which owns the token.
  *
  * Written as CommonJS because Electron preload scripts do not run through the
  * project's ESM build.
@@ -11,7 +11,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const MENU_CHANNELS = ['menu:open-workspace', 'menu:refresh', 'menu:view-pending', 'menu:view-activity', 'menu:view-files'];
 
 contextBridge.exposeInMainWorld('bridgeHost', {
-  /** Daemon URLs, the admin token, and the persisted workspace preference. */
+  /** Daemon URLs and the persisted workspace preference. No credential is included. */
   bootstrap: () => ipcRenderer.invoke('bootstrap'),
   /** Native folder picker; restarts the daemon on the chosen directory. */
   chooseWorkspace: () => ipcRenderer.invoke('workspace:choose'),
@@ -60,6 +60,19 @@ contextBridge.exposeInMainWorld('bridgeHost', {
   skillsChoose: () => ipcRenderer.invoke('skills:choose'),
   skillsInstall: (source) => ipcRenderer.invoke('skills:install', source),
   skillsRemove: (name) => ipcRenderer.invoke('skills:remove', name),
+  /**
+   * Admin-API proxies. Each of these is one daemon admin operation, executed in the main
+   * process with the admin token injected there. The renderer never holds the token, so none
+   * of these take a path, a method or headers — only the operation's own arguments.
+   */
+  adminWorkspaceTree: (relPath) => ipcRenderer.invoke('admin:workspace-tree', relPath),
+  adminWorkspaceFile: (relPath) => ipcRenderer.invoke('admin:workspace-file', relPath),
+  adminStatus: () => ipcRenderer.invoke('admin:status'),
+  adminEvents: (after) => ipcRenderer.invoke('admin:events', after),
+  adminApprovalDecision: (approvalId, approve) => ipcRenderer.invoke('admin:approval-decision', approvalId, approve),
+  adminPatchPreview: (workspaceId, patchId) => ipcRenderer.invoke('admin:patch-preview', workspaceId, patchId),
+  adminRevokeAll: () => ipcRenderer.invoke('admin:revoke-all'),
+  adminPairingDecision: (pairId, approve, accessMode) => ipcRenderer.invoke('admin:pairing-decision', pairId, approve, accessMode),
   /** Report the outcome of the window's own self test. Only used by --self-test. */
   selfTestResult: (report) => ipcRenderer.invoke('selftest:result', report),
   /**

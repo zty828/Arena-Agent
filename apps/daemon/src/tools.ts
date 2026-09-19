@@ -4,7 +4,7 @@ import { BridgeError, PageSchema, PathSchema, digest, publicError, type Invocati
 import { Store } from '../../../packages/storage/src/index.js';
 import { PolicyEngine } from '../../../packages/policy-engine/src/index.js';
 import { WorkspaceFiles } from '../../../packages/workspace-tools/src/files.js';
-import { PatchEngine, type PatchPreview } from '../../../packages/workspace-tools/src/patches.js';
+import { PatchEngine, type PatchPreview, type RecoveryReport } from '../../../packages/workspace-tools/src/patches.js';
 import { CommandRunner, COMMAND_DEFAULT_TIMEOUT_MS, COMMAND_MAX_TIMEOUT_MS } from '../../../packages/workspace-tools/src/command.js';
 import type { SkillRegistry } from '../../../packages/skills/src/index.js';
 
@@ -45,8 +45,8 @@ export const ToolDescriptions:Record<ToolName,string>={
   find_files:'Find authorized files using bounded glob patterns relative to root. Depth and scan limits are explicit.',
   search_files:'Bounded text search in UTF-8 files; regex=true uses a real regex, matched off the main thread under a 2s budget so a pathological pattern cannot wedge the bridge.',
   read_files:'Read up to 16 UTF-8 files or line ranges, preserving raw-byte SHA256 versions, BOM and newline metadata. No unsaved editor buffers.',
-  apply_patch:'Preview a create/update unified diff batch first; apply requires a separate local single-use approval and unchanged file versions. action=write does the same in one call, but only while the local unattended-write window is open. Delete/move unsupported.',
-  edit_file:'Replace an exact string in one file (the file must already exist; use apply_patch to create one). The diff is computed from the current bytes and goes through the same preview/approval/apply pipeline as apply_patch. old_string must be unique unless replace_all is set. expected_hash pins the version you read; omitted means "against the content now", which a concurrent change still fails.',
+  apply_patch:'Preview a create/update unified diff batch first; apply requires a separate local single-use approval and unchanged file versions. action=write does the same in one call, but only while the local unattended-write window is open. Delete/move unsupported. A leading BOM is preserved byte-for-byte and cannot be added or removed — a diff that would change the BOM is rejected as INVALID_PATCH; keep it out of your hunks.',
+  edit_file:'Replace an exact string in one file (the file must already exist; use apply_patch to create one). The diff is computed from the current bytes and goes through the same preview/approval/apply pipeline as apply_patch. old_string must be unique unless replace_all is set. expected_hash pins the version you read; omitted means "against the content now", which a concurrent change still fails. A leading BOM is preserved byte-for-byte and cannot be added or removed — a diff that would change the BOM is rejected as INVALID_PATCH.',
   run_command:'Run a shell command inside the workspace with the daemon user\'s privileges. Requires the exec access tier. Bounded by a timeout (default 30s, max 300s) and per-stream output caps; the process tree is killed on timeout, disconnect, revoke or shutdown. No interactive input (no PTY).',
   set_todos:'Replace this run\'s local task list. Status is a report, not verified task success.',
   report_progress:'Record an application progress event for this run; not an MCP protocol progress notification.',
@@ -91,7 +91,18 @@ export class ToolHost {
    * leave the operator with something they can neither see nor stop.
    */
   killCommands(reason:string):number{let count=0;for(const runtime of this.workspaces.values())count+=runtime.commands.killAll(reason);return count;}
-  async recover(workspaceId:string):Promise<PatchPreview[]>{return this.runtime(workspaceId).patches.recover();}
+  /**
+   * Recovery now returns a report: `recovered` are the rolled-back journals and `problems` are the
+   * transactions that could not be handled automatically (corrupt journals, lock contention,
+   * journal-less directories that still look live). Problems are also logged here — recovery is a
+   * loopback admin action with no run/request context, so the event log is otherwise the only
+   * place an operator would ever learn that a patch directory needs local attention.
+   */
+  async recover(workspaceId:string):Promise<RecoveryReport>{
+    const report=await this.runtime(workspaceId).patches.recover();
+    for(const problem of report.problems)this.store.event('patch.recovery.problem',{workspace_id:workspaceId,patch_id:problem.patch_id,code:problem.code,reason:problem.message});
+    return report;
+  }
   private runtime(id:string):WorkspaceRuntime{
     const r=this.workspaces.get(id);if(!r)throw new BridgeError('CAPABILITY_UNAVAILABLE',503,'Workspace is not mounted');return r;
   }

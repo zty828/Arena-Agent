@@ -179,6 +179,12 @@ let window: BrowserWindow | undefined;
 let selfTestTimer: NodeJS.Timeout | undefined;
 /** The operator credential for this process lifetime. Never written to disk. */
 let adminToken = '';
+/**
+ * Set when clearLeaseIfHolderIsGone() declined to clear a state lock, so startDaemon() can
+ * turn the daemon's terse refusal into an actionable message. Cleared on each start attempt;
+ * a value left over from an earlier workspace must never colour an unrelated failure.
+ */
+let refusedLease: { lock: string; pid: number } | undefined;
 
 /**
  * Publishes the endpoints, credential and workspace the running daemon actually bound to.
@@ -271,22 +277,49 @@ async function startDaemon(workspaceRoot: string, exposeHost?: string, remotePor
   // lease check exists to stop two daemons sharing one state directory, which is a real
   // corruption risk — so the answer is not to delete the lock blindly, but to confirm the
   // recorded holder is gone before clearing it.
+  refusedLease = undefined;
   clearLeaseIfHolderIsGone(stateDir);
-  daemon = await createDaemon({
-    schema_version: 1,
-    state_directory: stateDir,
-    // Port 0 = let the OS pick free ports; the renderer is told where to look, so
-    // nothing has to be memorised and nothing collides with a running CLI instance.
-    // The remote port is the exception: port 0 would be reassigned on every restart and the
-    // tunnel needs to be told a stable number before it opens, so it is pinned when exposing.
-    ports: { api: 0, mcp: 0, mcp_remote: exposeHost ? (remotePort ?? 0) : 0, admin: 0 },
-    workspaces: [{ root: workspaceRoot, display_name: path.basename(workspaceRoot) || workspaceRoot }],
-    response_mode: 'json',
-    security_profile: 'local_trusted_development',
-    arena_enabled: false,
-    remote_ingress: exposeHost ? exposedIngress(exposeHost) : closedIngress(),
-    gateway: { type: 'disabled' },
-  }, { adminToken, clientToken: newSecret(), mcpToken: newSecret() });
+  let handle: DaemonHandle;
+  try {
+    handle = await createDaemon({
+      schema_version: 1,
+      state_directory: stateDir,
+      // Port 0 = let the OS pick free ports; the renderer is told where to look, so
+      // nothing has to be memorised and nothing collides with a running CLI instance.
+      // The remote port is the exception: port 0 would be reassigned on every restart and the
+      // tunnel needs to be told a stable number before it opens, so it is pinned when exposing.
+      ports: { api: 0, mcp: 0, mcp_remote: exposeHost ? (remotePort ?? 0) : 0, admin: 0 },
+      workspaces: [{ root: workspaceRoot, display_name: path.basename(workspaceRoot) || workspaceRoot }],
+      response_mode: 'json',
+      security_profile: 'local_trusted_development',
+      arena_enabled: false,
+      remote_ingress: exposeHost ? exposedIngress(exposeHost) : closedIngress(),
+      gateway: { type: 'disabled' },
+    }, { adminToken, clientToken: newSecret(), mcpToken: newSecret() });
+  } catch (error) {
+    // When the refusal comes from a state lock we already inspected, the daemon's own message
+    // is not enough to act on: name the file and the pid it recorded, and say what the operator
+    // can do. Deleting the lock while its holder is alive is the one thing that must NOT be
+    // implied as safe, so the guidance is conditional.
+    if (refusedLease) {
+      const { lock, pid } = refusedLease;
+      refusedLease = undefined;
+      throw new Error([
+        `${String((error as Error)?.message ?? error)}`,
+        '',
+        `状态锁文件：${lock}`,
+        `锁里记录的进程号：${pid}`,
+        '',
+        '处理方法：',
+        `1. 先确认进程 ${pid} 是否还活着（任务管理器，或 PowerShell 里运行 Get-Process -Id ${pid}）。`,
+        '2. 如果有 daemon 正在运行，请直接使用它或先关掉它，不要删除锁文件。',
+        `3. 只有确认没有任何 daemon 在运行时，才可以删除 ${lock} 后重试。`,
+      ].join('\n'));
+    }
+    throw error;
+  }
+  refusedLease = undefined;
+  daemon = handle;
 }
 
 /**
@@ -344,6 +377,10 @@ function clearLeaseIfHolderIsGone(stateDir: string): void {
       // 'same' is a real daemon; 'unknown' cannot be proven either way, and clearing a real lock
       // risks two daemons sharing one state directory. Both keep the conservative behaviour.
       trace(`lease is held by process ${pid}, which is alive but not ours; leaving it in place`);
+      // Remember what was decided: the daemon start below will be refused with the daemon's own
+      // terse lock error, and the operator cannot act on that without knowing WHICH lock and
+      // WHICH pid. startDaemon enriches the refusal with these details.
+      refusedLease = { lock, pid };
       return;
     }
   }
@@ -421,8 +458,17 @@ function createWindow(): void {
   });
   window.once('ready-to-show', () => window?.show());
   window.on('closed', () => { window = undefined; });
-  // The harness is a local tool; never let it navigate anywhere but its own page.
-  window.webContents.setWindowOpenHandler(({ url }) => { void shell.openExternal(url); return { action: 'deny' }; });
+  // The harness is a local tool; never let it navigate anywhere but its own page. And only an
+  // https: URL is ever handed to the OS: `shell.openExternal` will happily execute `file:`
+  // and platform handler schemes (`ms-msdt:` was the classic exploit), so the scheme allowlist
+  // — not the URL's prettiness — is the check. An unparseable URL is denied, not opened.
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    let safe = false;
+    try { safe = new URL(url).protocol === 'https:'; } catch { safe = false; }
+    if (safe) void shell.openExternal(url);
+    else trace(`blocked a non-https window.open target: ${url}`);
+    return { action: 'deny' };
+  });
   void window.loadFile(assetPaths.page, selfTest ? { query: { selfTest: '1' } } : undefined);
   // In self-test mode the renderer must be allowed to fail loudly rather than silently
   // showing an empty shell, so surface every console message and load failure.
@@ -480,14 +526,29 @@ function buildMenu(): void {
 // --- IPC: the renderer never talks to the daemon's HTTP surface directly. It asks the
 // --- main process, which holds the credential. That keeps the token out of the page.
 
-ipcMain.handle('bootstrap', () => ({
-  adminUrl: daemon?.urls.admin ?? '',
-  apiUrl: daemon?.urls.api ?? '',
-  mcpUrl: daemon?.urls.mcp ?? '',
-  token: adminToken,
-  prefs: { ...readPrefs(), workspaceRoot: initialWorkspace() },
-  version: app.getVersion(),
-}));
+/**
+ * The bootstrap payload handed to the renderer.
+ *
+ * It deliberately no longer carries the admin token. The token now lives only in this process,
+ * and every admin-API call the window needs is one of the typed IPC handlers below — the same
+ * pattern the skills handlers already followed. A credential that never crosses contextBridge
+ * cannot leak through the page, its devtools, or a compromised renderer.
+ *
+ * Returned whole (rather than just the admin URL) by every IPC that restarts the daemon —
+ * workspace switch/choose, arena connect failure and arena disconnect all rotate the token and
+ * can re-bind ports, so the renderer re-syncs from this single payload on all of those paths.
+ */
+function bootstrapPayload(): Record<string, unknown> {
+  return {
+    adminUrl: daemon?.urls.admin ?? '',
+    apiUrl: daemon?.urls.api ?? '',
+    mcpUrl: daemon?.urls.mcp ?? '',
+    prefs: { ...readPrefs(), workspaceRoot: initialWorkspace() },
+    version: app.getVersion(),
+  };
+}
+
+ipcMain.handle('bootstrap', () => bootstrapPayload());
 
 ipcMain.handle('workspace:choose', async () => {
   const result = await dialog.showOpenDialog(window!, { properties: ['openDirectory'], title: '选择工作目录' });
@@ -500,8 +561,14 @@ ipcMain.handle('workspace:set', async (_event, root: string) => {
   return switchWorkspace(root);
 });
 
-async function switchWorkspace(root: string): Promise<{ changed: boolean; error?: string }> {
+async function switchWorkspace(root: string): Promise<Record<string, unknown>> {
   const resolved = path.resolve(root);
+  // Refused outright while the tunnel is open. A switch is a daemon restart, and a restart
+  // under a live tunnel would re-bind the remote listener for the NEW workspace — exposing the
+  // fresh directory under the pairing the operator approved for the old one (phantom exposure),
+  // while the window still shows the tunnel as connected to a bridge that no longer serves the
+  // tree on screen. Disconnect first; that is one click on the Arena panel.
+  if (tunnel) return { changed: false, error: '隧道还在开着：先在「接 Arena」页断开，再切换工作目录。' };
   try {
     if (!fs.statSync(resolved).isDirectory()) return { changed: false, error: '不是一个目录' };
   } catch { return { changed: false, error: '目录不存在：' + resolved }; }
@@ -538,19 +605,24 @@ async function switchWorkspace(root: string): Promise<{ changed: boolean; error?
         trace(`restoring ${previousRoot} also failed: ${String((restoreError as Error)?.message ?? restoreError)}`);
       }
     }
-    return {
+    const reply: Record<string, unknown> = {
       changed: false,
       error: recovered
         ? `切换失败：${detail}（已保留原来的工作目录）`
         : `切换失败：${detail}`,
     };
+    // The failure path still RESTARTED the daemon when the restore succeeded, and the restart
+    // rotated the admin token and re-picked the OS-assigned ports. The renderer polls those
+    // endpoints, so it has to be handed the fresh state rather than keep the dead ones forever.
+    if (recovered) reply.boot = bootstrapPayload();
+    return reply;
   }
   writePrefs(prefs);
   // The automated test drives whichever daemon the window is showing, and it reads the
   // endpoints from the handshake. Without republishing, a switch would leave the test talking
   // to the previous workspace's ports and quietly exercising the wrong daemon.
   publishE2eHandshake(resolved);
-  return { changed: true };
+  return { changed: true, boot: bootstrapPayload() };
 }
 
 ipcMain.handle('reveal', (_event, target: string) => {
@@ -754,6 +826,10 @@ async function connectArena(accessMode: AccessMode = 'ask'): Promise<Record<stri
     trace(`arena: ready at ${result.url} mode=${accessMode} unattended=${autoApprove.enabled}${autoApprove.unlimited ? ' (no expiry)' : ''} (clipboard ${clipboard.ok ? 'verified' : 'NOT verified'})`);
     return {
       ok: true,
+      // The daemon was restarted with the tunnel hostname above, so the token and the ports
+      // the renderer holds are stale. The fresh bootstrap rides along rather than requiring a
+      // second round trip (see the failure path below for the same rule).
+      boot: bootstrapPayload(),
       publicUrl: result.url,
       tunnelHost: host,
       pairingCode: pairing.code,
@@ -774,7 +850,11 @@ async function connectArena(accessMode: AccessMode = 'ask'): Promise<Record<stri
     await disconnectArena().catch(() => undefined);
     const detail = String((error as Error)?.message ?? error);
     trace(`arena: connect failed: ${detail}`);
-    return { ok: false, error: detail };
+    // The unwind above restarts the daemon (back to loopback-only) whenever the tunnel had
+    // come up, and that restart rotates the admin token and the OS-picked ports. Handing the
+    // renderer the fresh bootstrap here is what keeps it from polling the dead endpoints
+    // forever after a failed connect.
+    return { ok: false, error: detail, boot: bootstrapPayload() };
   }
 }
 
@@ -1030,7 +1110,13 @@ ipcMain.handle('arena:connect', async (_event, accessMode?: unknown) => {
   if (selfTest) selfTestRequestedMode = normaliseAccessMode(accessMode);
   return connectArena(normaliseAccessMode(accessMode));
 });
-ipcMain.handle('arena:disconnect', async () => ({ ok: true, wasOpen: await disconnectArena() }));
+ipcMain.handle('arena:disconnect', async () => {
+  const wasOpen = await disconnectArena();
+  // A disconnect restarts the daemon (loopback-only again) — same token/port rotation as a
+  // connect — so the fresh bootstrap goes back in the same envelope instead of being a second
+  // call the renderer could forget to make.
+  return wasOpen ? { ok: true, wasOpen, boot: bootstrapPayload() } : { ok: true, wasOpen };
+});
 /**
  * Unattended writes. GET is polled by the panel so its banner stays honest; POST toggles it.
  *
@@ -1123,6 +1209,108 @@ ipcMain.handle('skills:remove', async (_event, name?: unknown) => {
   trace(`skills: removed "${name}"`);
   return { ok: true };
 });
+
+// --- admin API proxies ---------------------------------------------------------------
+//
+// The renderer used to hold the admin token and call these endpoints over HTTP itself. It now
+// holds no credential at all: each operation is one typed IPC channel, and this process injects
+// the bearer. The pattern is the skills one above — validate the untrusted argument, forward
+// through `adminRequest` (which owns the token and the dead-socket retry), and translate a
+// non-2xx into a thrown error the renderer can toast. Nothing here takes a free-form path:
+// a generic "fetch any admin URL" channel would be the token in disguise.
+ipcMain.handle('admin:workspace-tree', async (_event, pathArg?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法读取目录');
+  const rel = typeof pathArg === 'string' && pathArg.length <= 1024 ? pathArg : '.';
+  const response = await adminRequest('/admin/v1/workspace/tree?path=' + encodeURIComponent(rel));
+  const body = await response.json() as { error?: { code?: string; message?: string } };
+  if (!response.ok) throw new Error(`${body?.error?.code ?? 'HTTP_' + response.status}: ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:workspace-file', async (_event, pathArg?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法读取文件');
+  if (typeof pathArg !== 'string' || !pathArg.trim() || pathArg.length > 1024) throw new Error('无效的文件路径');
+  const response = await adminRequest('/admin/v1/workspace/file?path=' + encodeURIComponent(pathArg));
+  const body = await response.json() as { error?: { code?: string; message?: string } };
+  // The code is echoed into the message because the viewer distinguishes expected refusals
+  // (BINARY_FILE / UNSUPPORTED_ENCODING) from real errors by prefix.
+  if (!response.ok) throw new Error(`${body?.error?.code ?? 'HTTP_' + response.status}: ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:status', async () => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法读取状态');
+  const response = await adminRequest('/admin/v1/status');
+  const body = await response.json() as { error?: { message?: string } };
+  if (!response.ok) throw new Error(`读取状态失败：HTTP ${response.status} ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:events', async (_event, after?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法读取事件');
+  const seq = typeof after === 'number' && Number.isFinite(after) && after >= 0 ? Math.floor(after) : 0;
+  const response = await adminRequest('/admin/v1/events?after=' + seq);
+  const body = await response.json() as { error?: { message?: string } };
+  if (!response.ok) throw new Error(`读取事件失败：HTTP ${response.status} ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:approval-decision', async (_event, approvalId?: unknown, approve?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法批准');
+  if (typeof approvalId !== 'string' || !approvalId.trim() || approvalId.length > 128) throw new Error('无效的审批编号');
+  const response = await adminRequest('/admin/v1/approvals/' + encodeURIComponent(approvalId) + '/decision', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approve: approve === true }),
+  });
+  const body = await response.json() as { error?: { code?: string; message?: string } };
+  if (!response.ok) throw new Error(`${body?.error?.code ?? 'HTTP_' + response.status}: ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:patch-preview', async (_event, workspaceId?: unknown, patchId?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法读取补丁');
+  if (typeof workspaceId !== 'string' || !workspaceId.trim() || workspaceId.length > 128) throw new Error('无效的工作区编号');
+  if (typeof patchId !== 'string' || !patchId.trim() || patchId.length > 128) throw new Error('无效的补丁编号');
+  const response = await adminRequest(
+    '/admin/v1/workspaces/' + encodeURIComponent(workspaceId) + '/patches/' + encodeURIComponent(patchId));
+  const body = await response.json() as { error?: { code?: string; message?: string } };
+  if (!response.ok) throw new Error(`${body?.error?.code ?? 'HTTP_' + response.status}: ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:revoke-all', async () => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法撤销授权');
+  // `confirm: true` is fixed here, not forwarded: the renderer already confirmed with the
+  // operator (its own dialog), and accepting a caller-supplied confirm would make the
+  // double-guard illusory.
+  const response = await adminRequest('/admin/v1/revoke-all', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ confirm: true }),
+  });
+  const body = await response.json() as { error?: { message?: string } };
+  if (!response.ok) throw new Error(`撤销授权失败：HTTP ${response.status} ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
+ipcMain.handle('admin:pairing-decision', async (_event, pairId?: unknown, approve?: unknown, accessMode?: unknown) => {
+  if (!daemon || !adminToken) throw new Error('bridge 尚未启动，无法处理配对请求');
+  if (typeof pairId !== 'string' || !pairId.trim() || pairId.length > 128) throw new Error('无效的 pair_id');
+  // The mode is echoed from the pairing request itself, so echoing it back can never raise the
+  // ceiling — but it is untrusted input all the same, so it goes through the normaliser rather
+  // than reaching the daemon verbatim. data_egress_ack is fixed for the same reason as the
+  // revoke confirm above.
+  const response = await adminRequest('/admin/v1/pairings/' + encodeURIComponent(pairId) + '/decision', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approve: approve === true, access_mode: normaliseAccessMode(accessMode), data_egress_ack: true }),
+  });
+  const body = await response.json() as { error?: { code?: string; message?: string } };
+  if (!response.ok) throw new Error(`${body?.error?.code ?? 'HTTP_' + response.status}: ${body?.error?.message ?? ''}`.trim());
+  return body;
+});
+
 ipcMain.handle('selftest:fixture', async (_event, action?: unknown, name?: unknown) => {
   if (!selfTest) throw new Error('the fixture hook is only available under --self-test');
   // The fixture only ever creates and deletes its own probe entries: no traversal, no absolute

@@ -325,7 +325,7 @@ for (const point of ['after_stage', 'before_rename', 'after_rename']) {
     await assert.rejects(engine.apply(preview.id, () => undefined), { code: 'PATCH_APPLY_FAILED' });
     assert.equal((await engine.get(preview.id)).state, 'rolled_back');
     await unchanged(root, { 'old.txt': 'original\n', 'created.txt': null });
-    assert.deepEqual(await engine.recover(), []);
+    assert.deepEqual(await engine.recover(), { recovered: [], problems: [] });
   });
 }
 
@@ -342,7 +342,7 @@ test('故障期间人工修改不被备份覆盖，结果为 unknown', async t =
   await assert.rejects(engine.apply(preview.id, () => undefined), { code: 'PATCH_STATE_UNKNOWN' });
   assert.equal((await engine.get(preview.id)).state, 'unknown');
   await unchanged(root, { 'file.txt': 'manual change\n' });
-  assert.deepEqual(await engine.recover(), []);
+  assert.deepEqual(await engine.recover(), { recovered: [], problems: [] });
 });
 
 function crashApply(root: string, state: string, id: string, point: string): void {
@@ -367,11 +367,12 @@ for (const point of ['after_stage', 'before_rename', 'after_rename']) test(`${po
   crashApply(root, state, preview.id, point);
   assert.equal((await engine.get(preview.id)).state, 'committing');
   const fresh = new PatchEngine(await WorkspaceFiles.open(root), state);
-  const recovered = await fresh.recover();
+  const { recovered, problems } = await fresh.recover();
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0]!.state, 'rolled_back');
+  assert.deepEqual(problems, []);
   await unchanged(root, { 'file.txt': 'old\n' });
-  assert.deepEqual(await fresh.recover(), []);
+  assert.deepEqual(await fresh.recover(), { recovered: [], problems: [] });
 });
 
 test('崩溃后人工编辑保持原样，恢复持久化 unknown', async t => {
@@ -381,7 +382,7 @@ test('崩溃后人工编辑保持原样，恢复持久化 unknown', async t => {
   const preview = await engine.prepare({ changes: [{ path: 'file.txt', expected_hash: sha256('old\n'), patch: update('file.txt', 'old', 'new') }] });
   crashApply(root, state, preview.id, 'after_rename');
   await fs.writeFile(path.join(root, 'file.txt'), 'human\n');
-  const recovered = await engine.recover();
+  const { recovered } = await engine.recover();
   assert.equal(recovered[0]!.state, 'unknown');
   assert.equal((await engine.get(preview.id)).state, 'unknown');
   await unchanged(root, { 'file.txt': 'human\n' });
@@ -434,7 +435,13 @@ test('共享状态目录中的跨进程提交锁不会让恢复或另一提交�
   });
   let authorized = false;
   await assert.rejects(engine.apply(second.id, () => { authorized = true; }), { code: 'PATCH_LOCKED' });
-  await assert.rejects(engine.recover(), { code: 'PATCH_LOCKED' });
+  // recover() no longer aborts on a locked live transaction: it records the locked id as a
+  // problem and keeps scanning, leaving the in-flight commit strictly alone.
+  const report = await engine.recover();
+  assert.deepEqual(report.recovered, []);
+  assert.equal(report.problems.length, 1);
+  assert.equal(report.problems[0]!.code, 'PATCH_LOCKED');
+  assert.equal(report.problems[0]!.patch_id, first.id);
   assert.equal(authorized, false);
   const finished = once(child, 'exit');
   child.stdin.end('continue');

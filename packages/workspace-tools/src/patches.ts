@@ -13,6 +13,10 @@ export interface PatchPreview {
   changes: { path: string; before_hash: string | null; after_hash: string; diff: string }[];
   created_at: number;
 }
+/** recover() 没能自动处理的一个事务：id、失败码和原因。恢复本身不被它中断。 */
+export interface RecoveryProblem { patch_id: string; code: string; message: string; }
+/** recover() 的报告：已回滚的预览列表 + 需要本地人工处理的问题列表。 */
+export interface RecoveryReport { recovered: PatchPreview[]; problems: RecoveryProblem[]; }
 type Phase = 'pending' | 'staging' | 'staged' | 'renaming' | 'renamed' | 'restoring' | 'restored';
 interface Journal { schema: 1; preview: PatchPreview; records: { mode: number; phase: Phase }[]; }
 interface Content { before: Buffer | null; after: Buffer; mode: number; }
@@ -20,6 +24,11 @@ interface HunkLine { kind: ' ' | '+' | '-'; text: string; crlf: boolean; noNewli
 interface Hunk { oldStart: number; oldCount: number; newStart: number; newCount: number; lines: HunkLine[]; }
 const MAX_BATCH_BYTES = 4 * 1024 * 1024;
 const MAX_JOURNAL_BYTES = 8 * 1024 * 1024;
+// prepare 不持有任何锁（id 公开之前无需互斥），guard/owner 存活性判定因此看不到一个
+// 进行中的 prepare。只有 mtime 足够旧的无日志目录才可能是残骸：prepare 的写入窗口是
+// 毫秒到秒级，而 recover 面对的残骸几乎都来自上一个进程生命周期。宁可跳过等下次恢复，
+// 也绝不动一个可能正在被写入的目录。
+const REAP_MIN_AGE_MS = 60_000;
 const ID = /^patch_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const lockTails = new Map<string, Promise<void>>();
@@ -420,6 +429,30 @@ export class PatchEngine {
   }
 
   /**
+   * 尽力清理一个没有 journal.json 的事务目录（prepare 失败留下的残骸）。
+   *
+   * 绝不能动一个还在被写入的目录：正常事务目录**总是**带日志（prepare 先写 before/after
+   * 再落 journal），recover 也不会把日志弄丢，所以「无日志」基本等价于「prepare 没走完」。
+   * 真正的门槛是活性：prepare 本身不持有 guard/owner 锁，存活性判定看不到它，因此只回收
+   * mtime 早于 REAP_MIN_AGE_MS 的目录（见常量处注释）。删除失败或判定为活跃都如实记入
+   * problems，不静默丢弃——留在原地等下次扫描，比删掉一个活体事务安全得多。
+   */
+  private async reapJournalLess(id: string, problems: RecoveryProblem[]): Promise<void> {
+    try {
+      const directory = this.transactionDirectory(id);
+      const stat = await fs.stat(directory);
+      if (!stat.isDirectory() || Date.now() - stat.mtimeMs < REAP_MIN_AGE_MS) {
+        problems.push({ patch_id: id, code: 'RECOVERY_SKIPPED', message: '事务目录缺少日志但最近仍被修改；为避免影响进行中的操作，暂不清理，下次恢复将重试' });
+        return;
+      }
+      await fs.rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      problems.push({ patch_id: id, code: 'RECOVERY_REAP_FAILED', message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  /**
    * A string-replacement edit, compiled into the same exact unified diff the patch engine
    * already consumes.
    *
@@ -506,15 +539,22 @@ export class PatchEngine {
       preview.digest = previewDigest(preview);
       await this.init();
       const directory = this.transactionDirectory(preview.id);
-      await fs.mkdir(directory, { mode: 0o700 });
-      for (const [index, content] of contents.entries()) {
-        if (content.before !== null) await writeExclusive(path.join(directory, `before-${index}.bin`), content.before, 0o600);
-        await writeExclusive(path.join(directory, `after-${index}.bin`), content.after, 0o600);
+      try {
+        await fs.mkdir(directory, { mode: 0o700 });
+        for (const [index, content] of contents.entries()) {
+          if (content.before !== null) await writeExclusive(path.join(directory, `before-${index}.bin`), content.before, 0o600);
+          await writeExclusive(path.join(directory, `after-${index}.bin`), content.after, 0o600);
+        }
+        const journal: Journal = { schema: 1, preview, records: contents.map(content => ({ mode: content.mode, phase: 'pending' })) };
+        await this.save(journal);
+        await syncDirectory(this.directory);
+        return structuredClone(preview);
+      } catch (error) {
+        // 中途失败会留下没有 journal.json 的半截事务目录，recover() 永远扫不到它（见下方
+        // 对无日志目录的 reaping 注释）。best-effort 清掉——清理失败不掩盖真实错误。
+        await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
       }
-      const journal: Journal = { schema: 1, preview, records: contents.map(content => ({ mode: content.mode, phase: 'pending' })) };
-      await this.save(journal);
-      await syncDirectory(this.directory);
-      return structuredClone(preview);
     } catch (error) { return ioError(error); }
   }
 
@@ -680,7 +720,7 @@ export class PatchEngine {
     }
   }
 
-  async recover(): Promise<PatchPreview[]> {
+  async recover(): Promise<RecoveryReport> {
     try {
       await this.init();
       const directory = await fs.opendir(this.directory);
@@ -695,20 +735,40 @@ export class PatchEngine {
         }
       } finally { await directory.close(); }
       const recovered: PatchPreview[] = [];
+      // 一个损坏的事务绝不能中断整次恢复：失败只记入 problems，后续 id 照常扫描。
+      // 之前的 rethrow 会让排在前面的坏日志挡住后面所有 committing 日志的回滚。
+      const problems: RecoveryProblem[] = [];
       for (const id of ids.sort()) {
         let initial: Journal;
         try { initial = await this.load(id); }
-        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            // 目录存在但日志缺失 ⇒ prepare 失败的残骸，恢复扫描永远够不到它。尽力回收；
+            // 内部会先做活性检查，进行中的 prepare 不会被误删（见 reapJournalLess 注释）。
+            await this.reapJournalLess(id, problems);
+            continue;
+          }
+          // 其他读取失败（损坏的日志等）只登记，不中断——该目录留给本地人工处理。
+          problems.push({ patch_id: id, code: error instanceof BridgeError ? error.code : 'IO_ERROR', message: error instanceof Error ? error.message : String(error) });
+          continue;
+        }
         if (initial.preview.state !== 'committing') continue;
-        await this.exclusive(initial.preview, async () => {
-          const journal = await this.load(id);
-          if (journal.preview.state !== 'committing') return;
-          try { await this.rollback(journal); }
-          catch { journal.preview.state = 'unknown'; await this.save(journal); }
-          recovered.push(structuredClone(journal.preview));
-        });
+        try {
+          await this.exclusive(initial.preview, async () => {
+            const journal = await this.load(id);
+            if (journal.preview.state !== 'committing') return;
+            try { await this.rollback(journal); }
+            catch { journal.preview.state = 'unknown'; await this.save(journal); }
+            recovered.push(structuredClone(journal.preview));
+          });
+        } catch (error) {
+          // PATCH_LOCKED（另一进程正在处理）与任何 IO/损坏错误都只是这**一个**事务的问题，
+          // 其余事务照常处理。事务目录留在原地，等锁释放或人工处理后再由下次恢复接手。
+          problems.push({ patch_id: id, code: error instanceof BridgeError ? error.code : 'IO_ERROR', message: error instanceof Error ? error.message : String(error) });
+          continue;
+        }
       }
-      return recovered;
+      return { recovered, problems };
     } catch (error) {
       // ioError 只负责**构造** BridgeError，它不抛。必须 return，否则引擎会把错误吞掉，
       // 对调用方返回 undefined——排障时看到的是一个没有 code 的 undefined，

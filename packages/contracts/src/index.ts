@@ -78,6 +78,10 @@ export interface Approval {
   id: string; run_id: string; grant_id: string; action: string; params_hash: string;
   description: string; state: 'pending' | 'approved' | 'denied' | 'consumed';
   approver_id: string | null; expires_at: number; created_at: number;
+  // The structured patch preview id this approval gates. Optional because approvals stored
+  // before this field existed only carried the id inside the description text; consumers must
+  // treat a missing value as "legacy, parse the description" and never invent one.
+  patch_id?: string | null;
 }
 export interface AuditEvent {
   schema_version: string; event_id: string; run_id: string | null; request_id: string | null;

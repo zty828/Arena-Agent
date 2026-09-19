@@ -2,7 +2,10 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:*">
+<!-- No remote connect-src at all: the renderer no longer fetches the daemon's admin API
+     directly — every call is an IPC to the main process, which owns the token. 'self' alone
+     also stops a compromised page from exfiltrating anything it can see. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'">
 <title>ArenaBridge</title>
 <link rel="stylesheet" href="app.css">
 </head>

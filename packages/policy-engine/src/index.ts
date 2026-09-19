@@ -280,7 +280,10 @@ export class PolicyEngine {
     return this.store.transaction(()=>{
       const p=this.store.get<Pairing>('pairings',arg.pair_id);
       if(!p||!p.claim_hash||!equal(p.claim_hash,sha256(arg.claim_secret))||p.expires_at<=Date.now()||p.epoch!==this.epoch) throw new BridgeError('AUTHORIZATION_REQUIRED',403,'Invalid pairing claim');
-      if(p.state==='pending') return {pair_id:p.id,state:'pending'};
+      // Pending carries expires_at so a client can tell "not approved yet" from "the pairing is
+      // about to die": an expired claim later surfaces as AUTHORIZATION_REQUIRED, which is
+      // indistinguishable from a wrong secret without this deadline.
+      if(p.state==='pending') return {pair_id:p.id,state:'pending',expires_at:p.expires_at};
       if(p.state!=='approved'||!p.approved_access) throw new BridgeError('AUTHORIZATION_REQUIRED',403,'Pairing is denied or already consumed');
       const principal:Principal={id:newId('principal'),kind:'remote_workspace',label:p.remote_label??'Remote Agent'};
       const run:Run={id:newId('run'),workspace_id:p.workspace_id,principal_id:principal.id,mode:'remote_workspace',execution_owner:'remote_workspace',state:'running',reason:null,policy_version:POLICY_VERSION,created_at:Date.now(),updated_at:Date.now()};
@@ -303,7 +306,9 @@ export class PolicyEngine {
     // expiry still caps it, so this never outlives the authorization that justifies it.
     const approvalTtlMs=Number(process.env.ARENABRIDGE_APPROVAL_TTL_MS ?? 300000);
     const ttl=Number.isFinite(approvalTtlMs)&&approvalTtlMs>0?approvalTtlMs:300000;
-    const approval:Approval={id:newId('approval'),run_id:grant.run_id,grant_id:grant.id,action:'workspace.patch',params_hash:paramsHash,description:`Apply reviewed patch ${patchId}`,state:'pending',approver_id:null,expires_at:Math.min(Date.now()+ttl,grant.expires_at),created_at:Date.now()};
+    // patch_id is stored as its own field (not only inside the description) so approval UIs can
+    // load the diff without scraping the human-readable text with a regex.
+    const approval:Approval={id:newId('approval'),run_id:grant.run_id,grant_id:grant.id,action:'workspace.patch',params_hash:paramsHash,description:`Apply reviewed patch ${patchId}`,patch_id:patchId,state:'pending',approver_id:null,expires_at:Math.min(Date.now()+ttl,grant.expires_at),created_at:Date.now()};
     this.store.put('approvals',approval);
     this.store.transition(grant.run_id,'waiting_for_approval','patch_requires_local_approval');
     this.store.event('approval.requested',{approval_id:approval.id,patch_id:patchId,params_hash:paramsHash},{run_id:grant.run_id,request_id:context.request_id});
